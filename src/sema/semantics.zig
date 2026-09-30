@@ -687,17 +687,24 @@ pub const Sema = struct {
                     else => .invalid,
                 };
 
-                if (stty == .invalid) {
-                    try self.compiler.add_sem_error("cannot access field '{s}' on non-struct type '{s}'", .{ fa.field, self.types.name_of(tty) }, .Error, fa.token);
-                    break :blk .invalid;
-                }
+                switch (fa.field.*) {
+                    .ident => |id| {
+                        if (stty == .invalid) {
+                            try self.compiler.add_sem_error("cannot access field '{s}' on non-struct type '{s}'", .{ id.name, self.types.name_of(tty) }, .Error, fa.token);
+                            break :blk .invalid;
+                        }
 
-                const sdef = self.types.get(stty).struct_ty;
-                for (sdef.fields.items) |sf| {
-                    if (std.mem.eql(u8, sf.name, fa.field)) break :blk sf.ty;
+                        const sdef = self.types.get(stty).struct_ty;
+                        for (sdef.fields.items) |sf| {
+                            if (std.mem.eql(u8, sf.name, id.name)) break :blk sf.ty;
+                        }
+                        try self.compiler.add_sem_error("struct '{s}' has no field '{s}'", .{ sdef.name, id.name }, .Error, fa.token);
+                        break :blk .invalid;
+                    },
+                    else => {
+                        break :blk .invalid;
+                    },
                 }
-                try self.compiler.add_sem_error("struct '{s}' has no field '{s}'", .{ sdef.name, fa.field }, .Error, fa.token);
-                break :blk .invalid;
             },
             .call => |*c| blk: {
                 const tmp = self.discard;

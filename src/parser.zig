@@ -1704,10 +1704,11 @@ pub const Parser = struct {
                     lhs.* = .{ .call = try self.parse_call_expression(prev_lhs) };
                 } else if (tok.type == .dot) {
                     _ = try self.lexer.next();
-                    const f = try self.expect(.ident, "expected field name") orelse token.Token{ .type = .ident, .val = "<error>", .line = tok.line, .col = tok.col };
+                    const bp = postfix_binding_power(.dot).?;
+                    const f = try self.parse_expression_bp(bp[1]);
                     const tmp = lhs;
                     lhs = try self.allocator.create(ast.Expr);
-                    lhs.* = .{ .field_access = .{ .target = tmp, .field = f.val, .token = f } };
+                    lhs.* = .{ .field_access = .{ .target = tmp, .field = f, .token = tok } };
                 } else if (tok.type == .l_bracket) {
                     _ = try self.lexer.next();
                     var args: std.ArrayList(*ast.Expr) = .empty;

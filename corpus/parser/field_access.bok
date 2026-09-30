@@ -1,0 +1,5 @@
+var c = Color.green;
+var o = Option.None;
+var a = Person.name[0];
+var m = Person.getName();
+var res = Result.Ok(10, "everything is ok");
