@@ -319,29 +319,90 @@ pub const Parser = struct {
         return s;
     }
 
+    // so ',' between member is optional only if it's before end
+    // also methods don't need ',' at all as seperators, as they
+    // are explictly blocks that ends with 'end'
+    fn check_struct_member_seperator(self: *Parser) !bool {
+        const nxt = try self.lexer.peek_token();
+        switch (nxt.type) {
+            .comma => {
+                _ = try self.lexer.next();
+                return true;
+            },
+            .kw_end => return true,
+            else => {
+                try self.compiler.addError("expected ',' or 'end'", err.Severity.Error, nxt);
+                return false;
+            },
+        }
+    }
+
     pub fn parse_struct_members(self: *Parser, s: *ast.StructDef) !void {
         var tok = try self.lexer.peek_token();
-        // parse struct fields
+        // parse struct fields and members
         while (true) {
             switch (tok.type) {
                 .kw_end => break,
-                .ident, .kw_pub => {
-                    const f = try self.parse_struct_fields();
-                    try s.fields.append(self.allocator, f);
-                    const nxt = try self.lexer.peek_token();
-                    if (nxt.type == .comma) {
-                        _ = try self.lexer.next();
-                    } else if (nxt.type != .kw_end) {
-                        try self.compiler.addError("expected ',' or 'end'", err.Severity.Error, nxt);
-                        // try self.sync(&.{.{ .kw_end, .kw_const, .kw_var }});
-                        break;
-                    }
+                .kw_func => {
+                    const f = try self.parse_func_def(false, false);
+                    try s.methods.append(self.allocator, .{ .func = f });
                     tok = try self.lexer.peek_token();
                 },
+                .kw_proc => {
+                    const f = try self.parse_proc_def(false, false);
+                    try s.methods.append(self.allocator, .{ .proc = f });
+                    tok = try self.lexer.peek_token();
+                },
+                .kw_pub => {
+                    _ = try self.lexer.next();
+                    const nxt = try self.lexer.peek_token();
+                    switch (nxt.type) {
+                        .ident => {
+                            const name_tok = try self.lexer.next();
+                            _ = try self.expect(.colon, "expected ':'");
+                            const ty = try self.parse_type();
+                            try s.fields.append(self.allocator, .{
+                                .is_pub = true,
+                                .name = name_tok.val,
+                                .type = ty,
+                                .token = nxt,
+                            });
+                            if (!try self.check_struct_member_seperator()) break;
+                            tok = try self.lexer.peek_token();
+                        },
+                        .kw_func => {
+                            const f = try self.parse_func_def(true, false);
+                            try s.methods.append(self.allocator, .{ .func = f });
+                            tok = try self.lexer.peek_token();
+                        },
+                        .kw_proc => {
+                            const p = try self.parse_proc_def(true, false);
+                            try s.methods.append(self.allocator, .{ .proc = p });
+                            tok = try self.lexer.peek_token();
+                        },
+                        else => {
+                            try self.compiler.addError("expected an ident, 'func', or `proc` after `pub`", err.Severity.Error, nxt);
+                            try self.sync(&.{ .kw_end, .kw_func, .kw_proc, .kw_pub });
+                            tok = try self.lexer.peek_token();
+                        },
+                    }
+                },
+
+                .ident => {
+                    const f = try self.parse_struct_fields();
+                    try s.fields.append(self.allocator, f);
+                    if (!try self.check_struct_member_seperator()) break;
+                    tok = try self.lexer.peek_token();
+                },
+
                 else => {
-                    try self.compiler.addError("expected struct fileds or struct member here ", err.Severity.Error, tok);
-                    try self.sync(&.{ .kw_import, .kw_func, .kw_const, .kw_var, .kw_type, .kw_extern, .kw_pub, .kw_proc });
-                    break;
+                    try self.compiler.addError(
+                        "expected struct field",
+                        err.Severity.Error,
+                        tok,
+                    );
+                    try self.sync(&.{ .kw_end, .kw_pub });
+                    tok = try self.lexer.peek_token();
                 },
             }
         }
