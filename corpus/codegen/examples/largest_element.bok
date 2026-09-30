@@ -1,5 +1,4 @@
 // output: 76
-
 func largest(list: []i32, lo: i32, hi: i32) -> i32
   var mx: i32 = undefined;
 
