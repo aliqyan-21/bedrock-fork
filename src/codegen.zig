@@ -1097,16 +1097,25 @@ pub const Codegen = struct {
         var field_index: usize = 0;
         var field_type: types.TypeId = .invalid;
         var found = false;
-        for (struct_info.fields.items, 0..) |field, i| {
-            if (std.mem.eql(u8, field.name, f_access.field)) {
-                field_index = i;
-                field_type = field.ty;
-                found = true;
-                break;
-            }
-        }
+        switch (f_access.field.*) {
+            .ident => |id| {
+                for (struct_info.fields.items, 0..) |field, i| {
+                    if (std.mem.eql(u8, field.name, id.name)) {
+                        field_index = i;
+                        field_type = field.ty;
+                        found = true;
+                        break;
+                    }
+                }
 
-        if (!found) return error.UnknownField;
+                if (!found) return error.UnknownField;
+            },
+            else => {
+                std.debug.print("tagname is {s}\n", .{@tagName(f_access.field.*)});
+                // TODO:
+                unreachable;
+            },
+        }
 
         const zero = llvm.LLVMConstInt(llvm.LLVMInt32TypeInContext(self.ctx), 0, 0);
         const field_idx = llvm.LLVMConstInt(llvm.LLVMInt32TypeInContext(self.ctx), field_index, 0);

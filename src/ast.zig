@@ -861,17 +861,21 @@ pub const UnaryExpr = struct {
 // A "." Ident
 pub const FieldAccessExpr = struct {
     target: *Expr,
-    field: []const u8,
+    field: *Expr,
     token: Token,
 
     pub fn print(self: *FieldAccessExpr, indent: usize) anyerror!void {
         for (0..indent) |_| std.debug.print(" ", .{});
-        std.debug.print("field access: {s}\n", .{self.field});
+        std.debug.print("field access:\n", .{});
+        try self.field.print(indent + 4);
+        for (0..indent) |_| std.debug.print(" ", .{});
+        std.debug.print("target:\n", .{});
         try self.target.print(indent + 4);
     }
 
     pub fn deinit(self: *FieldAccessExpr, allocator: std.mem.Allocator) void {
         self.target.deinit(allocator);
+        self.field.deinit(allocator);
     }
 };
 
