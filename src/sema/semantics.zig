@@ -107,14 +107,30 @@ pub const Sema = struct {
     fn qualify(self: *Sema, owner: []const u8, name: []const u8) ![]const u8 {
         return std.fmt.allocPrint(self.types.arena.allocator(), "{s}.{s}", .{ owner, name });
     }
+
+    // checks if method and field name clashes and give errors
+    fn check_method(self: *Sema, s: *ast.StructDef, name: []const u8, tok: Token) !void {
+        for (s.fields.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) {
+                try self.compiler.add_sem_error("method '{s}' clashes with the field of the same name", .{name}, .Error, tok);
+            }
+        }
+    }
+
     // in two passes we first declare the signature
     // of all methods in struct (so methods can call
     // each other in any order) then again we do pass
     // and this time we visit the bodies of methods.
     fn visit_method(self: *Sema, s: *ast.StructDef) !void {
         for (s.methods.items) |*m| switch (m.*) {
-            .func => |*f| try self.declare_func(f, try self.qualify(s.name, f.name)),
-            .proc => |*p| try self.declare_proc(p, try self.qualify(s.name, p.name)),
+            .func => |*f| {
+                try self.check_method(s, f.name, f.token);
+                try self.declare_func(f, try self.qualify(s.name, f.name));
+            },
+            .proc => |*p| {
+                try self.check_method(s, p.name, p.token);
+                try self.declare_proc(p, try self.qualify(s.name, p.name));
+            },
         };
         for (s.methods.items) |*m| switch (m.*) {
             .func => |*f| try self.visit_function(f),
