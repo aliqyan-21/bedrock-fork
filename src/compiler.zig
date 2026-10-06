@@ -275,7 +275,7 @@ pub const Compiler = struct {
 
             if (self.opt.emit_obj) {
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
-                const obj_path = try std.fmt.bufPrintZ(&buf, "{s}.o", .{self.opt.output});
+                const obj_path = try std.fmt.bufPrint(&buf, "{s}.o", .{self.opt.output});
                 _ = llvm.LLVMTargetMachineEmitToFile(c.tm, c.mod, obj_path.ptr, llvm.LLVMObjectFile, &err_msg);
                 if (err_msg) |msg| {
                     log.err("{s}\n", .{std.mem.span(msg)});

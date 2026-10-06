@@ -98,24 +98,18 @@ pub const Codegen = struct {
     pub fn codegen_alloc_mem(self: *Codegen) !void {
         const ret_init = llvm.LLVMVoidTypeInContext(self.ctx);
         const func_type_init: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_init, null, 0, 0);
-        const name_init = try self.allocator.dupeZ(u8, "bok_init");
-        defer self.allocator.free(name_init);
-        const func_init: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name_init.ptr, func_type_init);
+        const func_init: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, "bok_init", func_type_init);
         llvm.LLVMSetLinkage(func_init, llvm.LLVMExternalLinkage);
 
         const ret_deinit = llvm.LLVMVoidTypeInContext(self.ctx);
         const func_type_deinit: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_deinit, null, 0, 0);
-        const name_deinit = try self.allocator.dupeZ(u8, "bok_deinit");
-        defer self.allocator.free(name_deinit);
-        const func_deinit: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name_deinit.ptr, func_type_deinit);
+        const func_deinit: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, "bok_deinit", func_type_deinit);
         llvm.LLVMSetLinkage(func_deinit, llvm.LLVMExternalLinkage);
 
         const ret_alloc = llvm.LLVMPointerTypeInContext(self.ctx, 0);
         var params_alloc: [1]llvm.LLVMTypeRef = .{llvm.LLVMInt64TypeInContext(self.ctx)};
         const func_type_alloc: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_alloc, @ptrCast(&params_alloc), 1, 0);
-        const name_alloc = try self.allocator.dupeZ(u8, "bok_alloc");
-        defer self.allocator.free(name_alloc);
-        const func_alloc: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name_alloc.ptr, func_type_alloc);
+        const func_alloc: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, "bok_alloc", func_type_alloc);
         llvm.LLVMSetLinkage(func_alloc, llvm.LLVMExternalLinkage);
     }
 
@@ -169,7 +163,7 @@ pub const Codegen = struct {
         else
             try self.get_llvm_type_of(self.expr_type(v.value));
 
-        const name = try self.allocator.dupeZ(u8, v.name);
+        const name = try self.allocator.dupe(u8, v.name);
         defer self.allocator.free(name);
 
         const global = llvm.LLVMAddGlobal(self.mod, ty, name.ptr);
@@ -185,7 +179,7 @@ pub const Codegen = struct {
         else
             try self.get_llvm_type_of(self.expr_type(c.value));
 
-        const name = try self.allocator.dupeZ(u8, c.name);
+        const name = try self.allocator.dupe(u8, c.name);
         defer self.allocator.free(name);
 
         const global = llvm.LLVMAddGlobal(self.mod, ty, name.ptr);
@@ -202,7 +196,7 @@ pub const Codegen = struct {
         defer self.allocator.free(params);
         const params_len: c_uint = @intCast(function.params.items.len);
         const func_type: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_type, params.ptr, params_len, 0);
-        const name = try self.allocator.dupeZ(u8, function.name);
+        const name = try self.allocator.dupe(u8, function.name);
         defer self.allocator.free(name);
         const main_func: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name.ptr, func_type);
         if (main_func != null) {
@@ -253,7 +247,7 @@ pub const Codegen = struct {
         defer self.allocator.free(params);
         const params_len: c_uint = @intCast(proc.params.items.len);
         const func_type: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_type, params.ptr, params_len, 0);
-        const name = try self.allocator.dupeZ(u8, proc.name);
+        const name = try self.allocator.dupe(u8, proc.name);
         defer self.allocator.free(name);
         const main_func: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name.ptr, func_type);
         if (main_func != null) {
@@ -314,7 +308,7 @@ pub const Codegen = struct {
         const params_len: c_uint = @intCast(e.kind.func.params.items.len);
         const is_vararg: c_int = if (e.kind.func.is_variadic) 1 else 0;
         const func_type: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_type, params.ptr, params_len, is_vararg);
-        const name = try self.allocator.dupeZ(u8, e.kind.func.name);
+        const name = try self.allocator.dupe(u8, e.kind.func.name);
         defer self.allocator.free(name);
         const func: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name.ptr, func_type);
         llvm.LLVMSetLinkage(func, llvm.LLVMExternalLinkage);
@@ -336,7 +330,7 @@ pub const Codegen = struct {
         const params_len: c_uint = @intCast(e.kind.proc.params.items.len);
         const is_vararg: c_int = if (e.kind.proc.is_variadic) 1 else 0;
         const func_type: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_type, params.ptr, params_len, is_vararg);
-        const name = try self.allocator.dupeZ(u8, e.kind.proc.name);
+        const name = try self.allocator.dupe(u8, e.kind.proc.name);
         defer self.allocator.free(name);
         const func: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name.ptr, func_type);
         llvm.LLVMSetLinkage(func, llvm.LLVMExternalLinkage);
@@ -367,7 +361,7 @@ pub const Codegen = struct {
             fields[idx] = t;
         }
 
-        const name = try self.allocator.dupeZ(u8, s_def.name);
+        const name = try self.allocator.dupe(u8, s_def.name);
         defer self.allocator.free(name);
         const s_ty = llvm.LLVMStructTypeInContext(
             self.ctx,
@@ -376,7 +370,7 @@ pub const Codegen = struct {
             0,
         );
         try self.struct_types.put(s_def.name, s_ty);
-        _ = llvm.LLVMStructCreateNamed(self.ctx, name);
+        _ = llvm.LLVMStructCreateNamed(self.ctx, @ptrCast(name));
     }
 
     pub fn codegen_statements(self: *Codegen, stmts: std.ArrayList(ast.Stmt)) !llvm.LLVMBasicBlockRef {
@@ -600,9 +594,9 @@ pub const Codegen = struct {
             index_alloca,
         );
 
-        const name = try self.allocator.dupeZ(u8, f.binding);
+        const name = try self.allocator.dupe(u8, f.binding);
         defer self.allocator.free(name);
-        const i_alloca = llvm.LLVMBuildAlloca(self.builder, llvm_ty, name);
+        const i_alloca = llvm.LLVMBuildAlloca(self.builder, llvm_ty, @ptrCast(name));
         const e_alloca = try self.enumerate_setup(f);
         try self.stack_map.put(f.binding, i_alloca);
 
@@ -689,9 +683,9 @@ pub const Codegen = struct {
         const inc_bb = llvm.LLVMAppendBasicBlockInContext(self.ctx, func, "inc_bb");
         const merge_bb = llvm.LLVMAppendBasicBlockInContext(self.ctx, func, "for_merge");
 
-        const name = try self.allocator.dupeZ(u8, f.binding);
+        const name = try self.allocator.dupe(u8, f.binding);
         defer self.allocator.free(name);
-        const i_alloca = llvm.LLVMBuildAlloca(self.builder, llvm_ty, name);
+        const i_alloca = llvm.LLVMBuildAlloca(self.builder, llvm_ty, @ptrCast(name));
         const e_alloca = try self.enumerate_setup(f);
         _ = llvm.LLVMBuildStore(self.builder, lo, i_alloca);
         try self.stack_map.put(f.binding, i_alloca);
@@ -976,16 +970,16 @@ pub const Codegen = struct {
 
     pub fn codegen_alloca_var(self: *Codegen, v: *ast.VarStmt) !llvm.LLVMValueRef {
         const t = if (v.type_ann) |ann| try self.get_type(ann) else try self.get_llvm_type_of(self.expr_type(v.value));
-        const name = try self.allocator.dupeZ(u8, v.name);
+        const name = try self.allocator.dupe(u8, v.name);
         defer self.allocator.free(name);
-        return llvm.LLVMBuildAlloca(self.builder, t, name);
+        return llvm.LLVMBuildAlloca(self.builder, t, @ptrCast(name));
     }
 
     pub fn codegen_alloca_const(self: *Codegen, v: *ast.ConstStmt) !llvm.LLVMValueRef {
         const t = if (v.type_ann) |ann| try self.get_type(ann) else try self.get_llvm_type_of(self.expr_type(v.value));
-        const name = try self.allocator.dupeZ(u8, v.name);
+        const name = try self.allocator.dupe(u8, v.name);
         defer self.allocator.free(name);
-        return llvm.LLVMBuildAlloca(self.builder, t, name);
+        return llvm.LLVMBuildAlloca(self.builder, t, @ptrCast(name));
     }
 
     pub fn codegen_params(self: *Codegen, params: std.ArrayList(ast.Param)) ![]llvm.LLVMTypeRef {
@@ -1000,9 +994,9 @@ pub const Codegen = struct {
 
     pub fn codegen_alloca(self: *Codegen, p: ast.Param) !llvm.LLVMValueRef {
         const t = try self.get_type(p.type);
-        const name = try self.allocator.dupeZ(u8, p.name);
+        const name = try self.allocator.dupe(u8, p.name);
         defer self.allocator.free(name);
-        return llvm.LLVMBuildAlloca(self.builder, t, name);
+        return llvm.LLVMBuildAlloca(self.builder, t, @ptrCast(name));
     }
 
     pub fn codegen_return(self: *Codegen, r: *ast.ReturnStmt) !llvm.LLVMValueRef {
@@ -1291,7 +1285,7 @@ pub const Codegen = struct {
             },
         };
 
-        const name_call = try self.allocator.dupeZ(u8, name);
+        const name_call = try self.allocator.dupe(u8, name);
         defer self.allocator.free(name_call);
         const func_ref = llvm.LLVMGetNamedFunction(self.mod, name_call.ptr);
 
@@ -1441,9 +1435,9 @@ pub const Codegen = struct {
             .bool_false => return llvm.LLVMConstInt(llvm.LLVMInt1TypeInContext(self.ctx), 0, 0),
             .char => return llvm.LLVMConstInt(llvm.LLVMInt8TypeInContext(self.ctx), l.raw[1], 0),
             .string => {
-                const name = try self.allocator.dupeZ(u8, l.raw);
+                const name = try self.allocator.dupe(u8, l.raw);
                 defer self.allocator.free(name);
-                return llvm.LLVMBuildGlobalString(self.builder, name, "");
+                return llvm.LLVMBuildGlobalString(self.builder, @ptrCast(name), "");
             },
         }
     }
@@ -1577,14 +1571,14 @@ pub const Codegen = struct {
         switch (expr.*) {
             .struct_literal => |*s| {
                 for (s.field_inits.items, 0..) |field_init, idx| {
-                    const name = try self.allocator.dupeZ(u8, field_init.name);
+                    const name = try self.allocator.dupe(u8, field_init.name);
                     defer self.allocator.free(name);
                     const field_ptr = llvm.LLVMBuildStructGEP2(
                         self.builder,
                         llvm_type,
                         ptr,
                         @intCast(idx),
-                        name,
+                        @ptrCast(name),
                     );
                     const value = try self.codegen_expression(field_init.value);
                     _ = llvm.LLVMBuildStore(self.builder, value, field_ptr);

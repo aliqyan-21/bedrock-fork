@@ -39,14 +39,14 @@ pub const TypeSystem = struct {
     allocator: std.mem.Allocator,
     types: std.ArrayList(Type),
     arena: std.heap.ArenaAllocator,
-    pids: [@typeInfo(Primitive).@"enum".fields.len]TypeId, // primtive ids
+    pids: [@typeInfo(Primitive).@"enum".field_names.len]TypeId, // primtive ids
     struct_reg: std.StringArrayHashMapUnmanaged(TypeId) = .empty, // struct registry for storing all defined struct (for codegen)
 
     pub fn init(allocator: std.mem.Allocator) TypeSystem {
         return .{
             .allocator = allocator,
             .types = .empty,
-            .pids = [_]TypeId{.invalid} ** @typeInfo(Primitive).@"enum".fields.len,
+            .pids = @splat(.invalid),
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
