@@ -138,6 +138,18 @@ pub const Sema = struct {
         };
     }
 
+    // it gets the struct type of a pointer struct
+    // and a normal struct so (self: *P) and (self: P)
+    // could be called in same way (p.foo()) and not (&p.foo())
+    fn struct_of(self: *Sema, tty: types.TypeId) types.TypeId {
+        if (tty == .invalid) return .invalid;
+        return switch (self.types.get(tty).*) {
+            .struct_ty => tty,
+            .pointer => |p| if (p.child != .invalid and self.types.get(p.child).* == .struct_ty) p.child else .invalid,
+            else => .invalid,
+        };
+    }
+
     fn visit_item(self: *Sema, item: *ast.Item) !void {
         switch (item.*) {
             .import_def => {},
@@ -722,14 +734,7 @@ pub const Sema = struct {
                 const tty = try self.visit_expression(fa.target, null);
                 if (tty == .invalid) break :blk .invalid;
 
-                const stty = switch (self.types.get(tty).*) {
-                    .struct_ty => tty,
-                    .pointer => |p| switch (self.types.get(p.child).*) {
-                        .struct_ty => p.child,
-                        else => .invalid,
-                    },
-                    else => .invalid,
-                };
+                const stty = self.struct_of(tty);
 
                 switch (fa.field.*) {
                     .ident => |id| {
