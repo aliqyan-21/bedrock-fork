@@ -23,6 +23,7 @@ pub const Symbol = struct {
     name: []const u8,
     kind: SymbolKind,
     ty: types.TypeId = .invalid,
+    has_self: bool = false, // self as first param (for struct)
     // here we keep growing accordingly,
 };
 
