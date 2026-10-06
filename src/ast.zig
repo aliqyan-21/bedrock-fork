@@ -94,6 +94,7 @@ pub const FunctionDef = struct {
             allocator.destroy(param.type);
         }
         self.params.deinit(allocator);
+        self.type_params.deinit(allocator);
         self.result.deinit(allocator);
         allocator.destroy(self.result);
         for (self.body.items) |*stmt| stmt.deinit(allocator);
@@ -209,6 +210,7 @@ pub const StructDef = struct {
             f.deinit(allocator);
         }
         self.fields.deinit(allocator);
+        for (self.methods.items) |*m| m.deinit(allocator);
         self.methods.deinit(allocator);
     }
 };
@@ -477,6 +479,13 @@ pub const MethodDef = union(enum) {
         switch (self.*) {
             .func => |*f| try f.print(indent),
             .proc => |*p| try p.print(indent),
+        }
+    }
+
+    pub fn deinit(self: *MethodDef, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .func => |*f| f.deinit(allocator),
+            .proc => |*p| p.deinit(allocator),
         }
     }
 };
