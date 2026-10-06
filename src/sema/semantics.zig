@@ -65,45 +65,53 @@ pub const Sema = struct {
         return false;
     }
 
+    fn declare_func(self: *Sema, f: *ast.FunctionDef, name: []const u8) !void {
+        var param_tys = std.ArrayList(types.TypeId).empty;
+        for (f.params.items) |*param| {
+            const pty = try self.types.resolve_type(param.type, self.scope);
+            if (pty == .invalid) {
+                try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
+            }
+            try param_tys.append(self.compiler.allocator, pty);
+        }
+        const rty = try self.types.resolve_type(f.result, self.scope);
+        if (rty == .invalid) {
+            try self.compiler.add_sem_error("unknown return type for function '{s}'", .{name}, .Error, f.result.token);
+        }
+        const fnty = try self.types.intern(.{ .function = .{ .params = param_tys, .result = rty } });
+        self.scope.declare(.{ .name = name, .kind = .func, .ty = fnty }) catch |e| {
+            if (e == error.DuplicateName) {
+                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{name}, .Error, f.token);
+            }
+        };
+    }
+
+    fn declare_proc(self: *Sema, p: *ast.ProcDef, name: []const u8) !void {
+        var param_tys = std.ArrayList(types.TypeId).empty;
+        for (p.params.items) |*param| {
+            const pty = try self.types.resolve_type(param.type, self.scope);
+            if (pty == .invalid) {
+                try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
+            }
+            try param_tys.append(self.compiler.allocator, pty);
+        }
+        const prty = try self.types.intern(.{ .procedure = .{ .params = param_tys } });
+        self.scope.declare(.{ .name = name, .kind = .func, .ty = prty }) catch |e| {
+            if (e == error.DuplicateName) {
+                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{name}, .Error, p.token);
+            }
+        };
+    }
+
     fn visit_item(self: *Sema, item: *ast.Item) !void {
         switch (item.*) {
             .import_def => {},
             .function => |*f| {
-                var param_tys = std.ArrayList(types.TypeId).empty;
-                for (f.params.items) |*param| {
-                    const pty = try self.types.resolve_type(param.type, self.scope);
-                    if (pty == .invalid) {
-                        try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
-                    }
-                    try param_tys.append(self.compiler.allocator, pty);
-                }
-                const rty = try self.types.resolve_type(f.result, self.scope);
-                if (rty == .invalid) {
-                    try self.compiler.add_sem_error("unknown return type for function '{s}'", .{f.name}, .Error, f.result.token);
-                }
-                const fnty = try self.types.intern(.{ .function = .{ .params = param_tys, .result = rty } });
-                self.scope.declare(.{ .name = f.name, .kind = .func, .ty = fnty }) catch |e| {
-                    if (e == error.DuplicateName) {
-                        try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{f.name}, .Error, f.token);
-                    }
-                };
+                try self.declare_func(f, f.name);
                 try self.visit_function(f);
             },
             .proc => |*p| {
-                var param_tys = std.ArrayList(types.TypeId).empty;
-                for (p.params.items) |*param| {
-                    const pty = try self.types.resolve_type(param.type, self.scope);
-                    if (pty == .invalid) {
-                        try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
-                    }
-                    try param_tys.append(self.compiler.allocator, pty);
-                }
-                const prty = try self.types.intern(.{ .procedure = .{ .params = param_tys } });
-                self.scope.declare(.{ .name = p.name, .kind = .func, .ty = prty }) catch |e| {
-                    if (e == error.DuplicateName) {
-                        try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{p.name}, .Error, p.token);
-                    }
-                };
+                try self.declare_proc(p, p.name);
                 try self.visit_proc(p);
             },
             .type_def => |t_def| {
