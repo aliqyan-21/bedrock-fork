@@ -1,0 +1,63 @@
+type P = struct
+  x: i32,
+
+  func bar(self: *P) -> i32
+    return self.x;
+  end
+
+  func add(self: *P, n: i32) -> i32
+    return self.x + n;
+  end
+
+  proc bump(self: *P)
+    self.x = self.x + 1;
+  end
+
+  pub func make(a: i32) -> i32
+    return a;
+  end
+end
+
+proc foo1()
+  var p = P where x = 1 end
+  var a = p.make(1); // error because make is static func
+end
+
+proc foo2()
+  P.nope(); // erro as no method nope
+end
+
+proc foo3()
+  var p = P where x = 1 end
+  var a = p.bar(1); // error as wrong number of args
+end
+
+proc foo4()
+  var p = P where x = 1 end
+  var a = p.add(true); // type mismatc
+end
+
+proc foo5()
+  const p = P where x = 1 end
+  p.bump(); // p is constant and self is pointer
+end
+
+proc foo6()
+  var n: i32 = 1;
+  n.foo(); // n is not struct
+end
+
+proc foo7()
+  var p = P where x = 1 end
+  p.bar(); // unused return error
+end
+
+proc foo8()
+  var p = P where x = 1 end
+  var z = p.bump(); // proc is returning error
+end
+
+proc foo9()
+  var p = P where x = 1 end
+  var f = p.baz(); // no field baz
+end

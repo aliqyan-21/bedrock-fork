@@ -1,12 +1,35 @@
 type P = struct
   x: i32,
-  func add(a: i32, b: i32) -> i32
-    return a + b;
+
+  func bar(self: *P) -> i32
+    return self.x;
+  end
+
+  func add(self: *P, n: i32) -> i32
+    return self.x + n;
+  end
+
+  proc bump(self: *P)
+    self.x = self.x + 1;
+  end
+
+  pub func make(a: i32) -> i32
+    return a;
+  end
+
+  pub func sum(self: *P) ->i32
+    return self.x + 10;
   end
 end
 
 proc main()
-  var e = P.add(1, 2);
-  var f = P.add(1); // error as wrong args (this is function and proc check direct!)
-  P.nope(); // no method present as nope
+  var p = P where x = 5 end
+  var pp = &p;
+  var a = p.bar();      // auto &
+  var b = pp.bar();     // already a pointer
+  var c = p.sum();      // by value self
+  var d = pp.sum();     // auto *
+  p.bump();
+  var f = P.bar(&p);    // explicit receiver
+  var g = p.make(1);    // error: static method
 end

@@ -591,28 +591,83 @@ pub const Sema = struct {
         };
     }
 
+    // method is dot callable only if it's first param is the struct (owner)
+    fn takes_reciever(self: *Sema, fnty: types.TypeId, owner: types.TypeId) bool {
+        const params = switch (self.types.get(fnty).*) {
+            .function => |f| f.params.items,
+            .procedure => |p| p.params.items,
+            else => return false,
+        };
+        if (params.len == 0 or params[0] == .invalid) return false;
+        const p0 = params[0];
+        return p0 == owner or (self.types.get(p0).* == .pointer and self.types.get(p0).pointer.child == owner);
+    }
+
+    // auto & and auto * so reciever mathces the method's first param
+    fn reciever_arg(self: *Sema, target: *ast.Expr, tty: types.TypeId, fnty: types.TypeId) !*ast.Expr {
+        const first = switch (self.types.get(fnty).*) {
+            .function => |f| f.params.items[0],
+            .procedure => |p| p.params.items[0],
+            else => unreachable,
+        };
+        const wantsptr = self.types.get(first).* == .pointer;
+        const isptr = self.types.get(tty).* == .pointer;
+        if (wantsptr == isptr) return target;
+
+        if (wantsptr and target.* == .ident) {
+            if (self.scope.resolve(target.ident.name)) |sym| {
+                if (sym.kind == .constant) {
+                    try self.compiler.add_sem_error("cannot call pointer r-reciever method on constant '{s}'", .{sym.name}, .Error, target.token_of());
+                }
+            }
+        }
+        const e = try self.compiler.allocator.create(ast.Expr);
+        e.* = .{ .unary = .{ .op = if (wantsptr) .addr_of else .deref, .operand = target, .token = target.token_of() } };
+        return e;
+    }
+
     // rewrite P.foo(a) into plain call to symbol "P.foo", so
     // normal call checking does the method work too for us!
-    fn lower_method_call(self: *Sema, c: *ast.CallExpr) !bool {
+    fn lower_method_call(self: *Sema, c: *ast.CallExpr) anyerror!bool {
         const fa = c.callee.field_access;
         const mname = switch (fa.field.*) {
             .ident => |i| i.name,
             else => return false,
         };
 
-        if (fa.target.* != .ident) return false;
-        const sym = self.scope.resolve(fa.target.ident.name) orelse return false;
-        if (sym.kind != .@"struct") return false;
-        const owner = sym.ty;
+        var owner: types.TypeId = .invalid;
+        var tty: types.TypeId = .invalid;
+        const via_type = fa.target.* == .ident and blk: {
+            const sym = self.scope.resolve(fa.target.ident.name) orelse break :blk false;
+            if (sym.kind != .@"struct") break :blk false;
+            owner = sym.ty;
+            break :blk true;
+        };
+        if (!via_type) {
+            tty = try self.visit_expression(fa.target, null);
+            if (tty == .invalid) return true;
+            owner = self.struct_of(tty);
+            if (owner == .invalid) return false;
+        }
 
         const qname = try self.qualify(self.types.get(owner).struct_ty.name, mname);
-        if (self.scope.resolve(qname) == null) {
+        const sym = self.scope.resolve(qname) orelse {
+            if (!via_type) return false;
             try self.compiler.add_sem_error("struct '{s}' has no method '{s}'", .{ self.types.name_of(owner), mname }, .Error, fa.token);
             return true;
+        };
+
+        if (!via_type) {
+            if (!self.takes_reciever(sym.ty, owner)) {
+                try self.compiler.add_sem_error("'{s}' is a static method; call it as {s}.{s}(...)", .{ mname, self.types.name_of(owner), mname }, .Error, fa.token);
+                return true;
+            }
+            const recv = try self.reciever_arg(fa.target, tty, sym.ty);
+            try c.args.insert(self.compiler.allocator, 0, .{ .value = recv });
         }
 
         fa.field.deinit(self.compiler.allocator);
-        fa.target.deinit(self.compiler.allocator);
+        if (via_type) fa.target.deinit(self.compiler.allocator);
 
         c.callee.* = .{ .ident = .{ .name = qname, .token = fa.token } };
         return false;
