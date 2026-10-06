@@ -1,0 +1,8 @@
+type P = struct
+  x: i32,
+end
+
+proc main()
+  var p = P where x = 10 end
+  var q = &p.x; // works now
+end

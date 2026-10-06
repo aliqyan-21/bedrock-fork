@@ -582,6 +582,15 @@ pub const Sema = struct {
         }
     }
 
+    // check if expression is lvalue or not
+    fn is_lvalue(e: *ast.Expr) bool {
+        return switch (e.*) {
+            .ident, .field_access, .index => true,
+            .unary => |u| u.op == .deref,
+            else => false,
+        };
+    }
+
     fn visit_expression(self: *Sema, expr: *ast.Expr, expected: ?types.TypeId) !types.TypeId {
         // std.debug.print("visiting expression\n", .{});
         const ty = switch (expr.*) {
@@ -700,8 +709,8 @@ pub const Sema = struct {
                         break :blk ty;
                     },
                     .addr_of => {
-                        if (u.operand.* != .ident) {
-                            try self.compiler.add_sem_error("cannot take address of non identifier expression", .{}, .Error, u.token);
+                        if (!is_lvalue(u.operand)) {
+                            try self.compiler.add_sem_error("cannot take address of a non-lvalue expression", .{}, .Error, u.token);
                             break :blk .invalid;
                         }
                         const innerty = try self.visit_expression(u.operand, null);
@@ -759,6 +768,7 @@ pub const Sema = struct {
                 const tmp = self.discard;
                 self.discard = false;
 
+                if (c.callee.* == .field_access and try self.lower_method_call(c)) break :blk .invalid;
                 const cty = try self.visit_expression(c.callee, null);
                 for (c.args.items) |arg| {
                     _ = try self.visit_expression(arg.value, null);
