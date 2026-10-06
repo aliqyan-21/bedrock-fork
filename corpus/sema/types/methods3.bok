@@ -1,0 +1,12 @@
+type P = struct
+  x: i32,
+  func add(a: i32, b: i32) -> i32
+    return a + b;
+  end
+end
+
+proc main()
+  var e = P.add(1, 2);
+  var f = P.add(1); // error as wrong args (this is function and proc check direct!)
+  P.nope(); // no method present as nope
+end

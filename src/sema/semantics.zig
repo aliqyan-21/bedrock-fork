@@ -591,6 +591,33 @@ pub const Sema = struct {
         };
     }
 
+    // rewrite P.foo(a) into plain call to symbol "P.foo", so
+    // normal call checking does the method work too for us!
+    fn lower_method_call(self: *Sema, c: *ast.CallExpr) !bool {
+        const fa = c.callee.field_access;
+        const mname = switch (fa.field.*) {
+            .ident => |i| i.name,
+            else => return false,
+        };
+
+        if (fa.target.* != .ident) return false;
+        const sym = self.scope.resolve(fa.target.ident.name) orelse return false;
+        if (sym.kind != .@"struct") return false;
+        const owner = sym.ty;
+
+        const qname = try self.qualify(self.types.get(owner).struct_ty.name, mname);
+        if (self.scope.resolve(qname) == null) {
+            try self.compiler.add_sem_error("struct '{s}' has no method '{s}'", .{ self.types.name_of(owner), mname }, .Error, fa.token);
+            return true;
+        }
+
+        fa.field.deinit(self.compiler.allocator);
+        fa.target.deinit(self.compiler.allocator);
+
+        c.callee.* = .{ .ident = .{ .name = qname, .token = fa.token } };
+        return false;
+    }
+
     fn visit_expression(self: *Sema, expr: *ast.Expr, expected: ?types.TypeId) !types.TypeId {
         // std.debug.print("visiting expression\n", .{});
         const ty = switch (expr.*) {
