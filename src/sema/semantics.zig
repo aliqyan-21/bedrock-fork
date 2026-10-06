@@ -103,6 +103,25 @@ pub const Sema = struct {
         };
     }
 
+    // just turn struct and field to struct.field
+    fn qualify(self: *Sema, owner: []const u8, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.types.arena.allocator(), "{s}.{s}", .{ owner, name });
+    }
+    // in two passes we first declare the signature
+    // of all methods in struct (so methods can call
+    // each other in any order) then again we do pass
+    // and this time we visit the bodies of methods.
+    fn visit_method(self: *Sema, s: *ast.StructDef) !void {
+        for (s.methods.items) |*m| switch (m.*) {
+            .func => |*f| try self.declare_func(f, try self.qualify(s.name, f.name)),
+            .proc => |*p| try self.declare_proc(p, try self.qualify(s.name, p.name)),
+        };
+        for (s.methods.items) |*m| switch (m.*) {
+            .func => |*f| try self.visit_function(f),
+            .proc => |*p| try self.visit_proc(p),
+        };
+    }
+
     fn visit_item(self: *Sema, item: *ast.Item) !void {
         switch (item.*) {
             .import_def => {},
@@ -114,7 +133,7 @@ pub const Sema = struct {
                 try self.declare_proc(p, p.name);
                 try self.visit_proc(p);
             },
-            .type_def => |t_def| {
+            .type_def => |*t_def| {
                 switch (t_def.variant) {
                     .struct_def => |*s| {
                         var field_tys = std.ArrayList(types.StFieldTy).empty;
@@ -134,7 +153,8 @@ pub const Sema = struct {
                             }
                         };
 
-                        try self.visit_struct_def(@constCast(s));
+                        try self.visit_struct_def(s);
+                        try self.visit_method(s);
                     },
                     .enum_def => |*en| {
                         var vartys = std.ArrayList(types.EnumVaraintTy).empty;
