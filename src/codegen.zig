@@ -196,7 +196,9 @@ pub const Codegen = struct {
         defer self.allocator.free(params);
         const params_len: c_uint = @intCast(func.params.items.len);
         const func_type: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_type, params.ptr, params_len, 0);
-        const function: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name.ptr, func_type);
+        const n = try self.allocator.dupe(u8, name);
+        defer self.allocator.free(n);
+        const function: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, n.ptr, func_type);
         for (func.params.items, 0..) |p, idx| {
             const arg = llvm.LLVMGetParam(function, @intCast(idx));
             llvm.LLVMSetValueName2(arg, @ptrCast(p.name), p.name.len);
@@ -205,7 +207,9 @@ pub const Codegen = struct {
     }
 
     pub fn codegen_function(self: *Codegen, function: *ast.FunctionDef, name: []const u8) !void {
-        const existing = llvm.LLVMGetNamedFunction(self.mod, name.ptr);
+        const n = try self.allocator.dupe(u8, name);
+        defer self.allocator.free(n);
+        const existing = llvm.LLVMGetNamedFunction(self.mod, n.ptr);
         const main_func: llvm.LLVMValueRef = if (existing != null) existing else try self.declare_function(function, name);
         self.entry = llvm.LLVMAppendBasicBlockInContext(self.ctx, main_func, "entry");
         llvm.LLVMPositionBuilderAtEnd(self.builder, self.entry);
@@ -246,8 +250,10 @@ pub const Codegen = struct {
         const params = try self.codegen_params(proc.params);
         defer self.allocator.free(params);
         const params_len: c_uint = @intCast(proc.params.items.len);
-        const func_type: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_type, params.ptr, params_len, 0);
-        const procedure: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, name.ptr, func_type);
+        const proc_type: llvm.LLVMTypeRef = llvm.LLVMFunctionType(ret_type, params.ptr, params_len, 0);
+        const n = try self.allocator.dupe(u8, name);
+        defer self.allocator.free(n);
+        const procedure: llvm.LLVMValueRef = llvm.LLVMAddFunction(self.mod, n.ptr, proc_type);
         for (proc.params.items, 0..) |p, idx| {
             const arg = llvm.LLVMGetParam(procedure, @intCast(idx));
             llvm.LLVMSetValueName2(arg, @ptrCast(p.name), p.name.len);
@@ -256,7 +262,9 @@ pub const Codegen = struct {
     }
 
     pub fn codegen_proc(self: *Codegen, proc: *ast.ProcDef, name: []const u8) !void {
-        const existing = llvm.LLVMGetNamedFunction(self.mod, name.ptr);
+        const n = try self.allocator.dupe(u8, name);
+        defer self.allocator.free(n);
+        const existing = llvm.LLVMGetNamedFunction(self.mod, n.ptr);
         const main_func: llvm.LLVMValueRef = if (existing != null) existing else try self.declare_proc(proc, name);
         self.entry = llvm.LLVMAppendBasicBlockInContext(self.ctx, main_func, "entry");
         llvm.LLVMPositionBuilderAtEnd(self.builder, self.entry);
