@@ -1064,37 +1064,12 @@ pub const Codegen = struct {
         var struct_ptr: llvm.LLVMValueRef = undefined;
         switch (target_type.*) {
             .struct_ty => {
-                var struct_slot: llvm.LLVMValueRef = null;
-                switch (f_access.target.*) {
-                    .ident => |i| struct_slot = self.stack_map.get(i.name) orelse return error.VariableNotFound,
-                    .index => |*i| {
-                        const index_st = try self.codegen_index(i, true);
-                        struct_slot = index_st;
-                    },
-                    else => return error.InvalidFieldAccess,
-                }
-
                 struct_ty_id = target_ty;
-                const llvm_struct_ty = try self.get_llvm_type_of(struct_ty_id);
-                struct_ptr = struct_slot;
-                _ = llvm_struct_ty;
+                struct_ptr = try self.codegen_addr_of(f_access.target);
             },
             .pointer => |p| {
-                // NOTE: currently only for structs field access
-                const ident = switch (f_access.target.*) {
-                    .ident => |i| i,
-                    else => return error.InvalidFieldAccess,
-                };
-
                 struct_ty_id = p.child;
-                const struct_slot = self.stack_map.get(ident.name) orelse return error.VariableNotFound;
-                const ptr_ty = try self.get_llvm_type_of(target_ty);
-                struct_ptr = llvm.LLVMBuildLoad2(
-                    self.builder,
-                    ptr_ty,
-                    struct_slot,
-                    "",
-                );
+                struct_ptr = try self.codegen_expression(f_access.target);
             },
 
             else => return error.InvalidFieldAccess,
@@ -1246,7 +1221,7 @@ pub const Codegen = struct {
         const target_type = self.compiler.sema.types.get(target_ty);
         switch (target_type.*) {
             .array => return self.codegen_array_index(i, target_ty, field_mem_access),
-            .slice => return self.codegen_slice_index(i, target_ty, false),
+            .slice => return self.codegen_slice_index(i, target_ty, field_mem_access),
             else => return error.InvalidIndex,
         }
     }
