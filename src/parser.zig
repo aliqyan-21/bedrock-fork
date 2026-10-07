@@ -1275,14 +1275,17 @@ pub const Parser = struct {
         const size_tok = try self.lexer.peek_token();
         var size: ast.ArraySize = .inferred;
 
-        if (size_tok.type == token.TokenType.integer) {
+        if (size_tok.type == token.TokenType.ident and std.mem.eql(u8, size_tok.val, "_")) {
             _ = try self.lexer.next();
-            size = .{ .fixed = size_tok.val };
-        } else if (size_tok.type == token.TokenType.ident and std.mem.eql(u8, size_tok.val, "_")) {
-            _ = try self.lexer.next();
-            size = .inferred;
         } else {
-            try self.compiler.addError("expected an INTEGER or '_'", err.Severity.Error, size_tok);
+            const e = try self.parse_expression();
+            if (e.* == .literal and e.literal.kind == .integer) {
+                const raw = e.literal.raw;
+                e.deinit(self.allocator);
+                size = .{ .fixed = raw };
+            } else {
+                size = .{ .expr = e };
+            }
         }
 
         if (try self.expect(.r_bracket, "expected ']'") == null) {

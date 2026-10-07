@@ -527,12 +527,17 @@ pub const PrimitiveType = enum {
 
 pub const ArraySize = union(enum) {
     fixed: []const u8, // INTEGER
+    expr: *Expr, // W, W * H, etc.
     inferred, // "_"
 
     pub fn print(self: *ArraySize, indent: usize) anyerror!void {
         for (0..indent) |_| std.debug.print(" ", .{});
         switch (self.*) {
             .fixed => |s| std.debug.print("array size: {s}\n", .{s}),
+            .expr => |e| {
+                std.debug.print("array size: const expr\n", .{});
+                try e.print(indent + 4);
+            },
             .inferred => std.debug.print("array size: inferred\n", .{}),
         }
     }
@@ -636,6 +641,7 @@ pub const BaseType = union(enum) {
                 allocator.destroy(p);
             },
             .array => |*a| {
+                if (a.size == .expr) a.size.expr.deinit(allocator);
                 a.elem.deinit(allocator);
                 allocator.destroy(a.elem);
             },

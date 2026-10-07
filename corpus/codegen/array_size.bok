@@ -1,0 +1,8 @@
+// output: 0
+const RAM = 1024;
+
+func main() -> i32
+  // resolve RAM value in sema
+  var mem: [RAM]u32 = undefined;
+  return 0;
+end
