@@ -65,48 +65,103 @@ pub const Sema = struct {
         return false;
     }
 
+    fn declare_func(self: *Sema, f: *ast.FunctionDef, name: []const u8) !void {
+        var param_tys = std.ArrayList(types.TypeId).empty;
+        for (f.params.items) |*param| {
+            const pty = try self.types.resolve_type(param.type, self.scope);
+            if (pty == .invalid) {
+                try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
+            }
+            try param_tys.append(self.compiler.allocator, pty);
+        }
+        const rty = try self.types.resolve_type(f.result, self.scope);
+        if (rty == .invalid) {
+            try self.compiler.add_sem_error("unknown return type for function '{s}'", .{name}, .Error, f.result.token);
+        }
+        const fnty = try self.types.intern(.{ .function = .{ .params = param_tys, .result = rty } });
+        self.scope.declare(.{ .name = name, .kind = .func, .ty = fnty }) catch |e| {
+            if (e == error.DuplicateName) {
+                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{name}, .Error, f.token);
+            }
+        };
+    }
+
+    fn declare_proc(self: *Sema, p: *ast.ProcDef, name: []const u8) !void {
+        var param_tys = std.ArrayList(types.TypeId).empty;
+        for (p.params.items) |*param| {
+            const pty = try self.types.resolve_type(param.type, self.scope);
+            if (pty == .invalid) {
+                try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
+            }
+            try param_tys.append(self.compiler.allocator, pty);
+        }
+        const prty = try self.types.intern(.{ .procedure = .{ .params = param_tys } });
+        self.scope.declare(.{ .name = name, .kind = .func, .ty = prty }) catch |e| {
+            if (e == error.DuplicateName) {
+                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{name}, .Error, p.token);
+            }
+        };
+    }
+
+    // just turn struct and field to struct.field
+    fn qualify(self: *Sema, owner: []const u8, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.types.arena.allocator(), "{s}.{s}", .{ owner, name });
+    }
+
+    // checks if method and field name clashes and give errors
+    fn check_method(self: *Sema, s: *ast.StructDef, name: []const u8, tok: Token) !void {
+        for (s.fields.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) {
+                try self.compiler.add_sem_error("method '{s}' clashes with the field of the same name", .{name}, .Error, tok);
+            }
+        }
+    }
+
+    // in two passes we first declare the signature
+    // of all methods in struct (so methods can call
+    // each other in any order) then again we do pass
+    // and this time we visit the bodies of methods.
+    fn visit_method(self: *Sema, s: *ast.StructDef) !void {
+        for (s.methods.items) |*m| switch (m.*) {
+            .func => |*f| {
+                try self.check_method(s, f.name, f.token);
+                try self.declare_func(f, try self.qualify(s.name, f.name));
+            },
+            .proc => |*p| {
+                try self.check_method(s, p.name, p.token);
+                try self.declare_proc(p, try self.qualify(s.name, p.name));
+            },
+        };
+        for (s.methods.items) |*m| switch (m.*) {
+            .func => |*f| try self.visit_function(f),
+            .proc => |*p| try self.visit_proc(p),
+        };
+    }
+
+    // it gets the struct type of a pointer struct
+    // and a normal struct so (self: *P) and (self: P)
+    // could be called in same way (p.foo()) and not (&p.foo())
+    fn struct_of(self: *Sema, tty: types.TypeId) types.TypeId {
+        if (tty == .invalid) return .invalid;
+        return switch (self.types.get(tty).*) {
+            .struct_ty => tty,
+            .pointer => |p| if (p.child != .invalid and self.types.get(p.child).* == .struct_ty) p.child else .invalid,
+            else => .invalid,
+        };
+    }
+
     fn visit_item(self: *Sema, item: *ast.Item) !void {
         switch (item.*) {
             .import_def => {},
             .function => |*f| {
-                var param_tys = std.ArrayList(types.TypeId).empty;
-                for (f.params.items) |*param| {
-                    const pty = try self.types.resolve_type(param.type, self.scope);
-                    if (pty == .invalid) {
-                        try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
-                    }
-                    try param_tys.append(self.compiler.allocator, pty);
-                }
-                const rty = try self.types.resolve_type(f.result, self.scope);
-                if (rty == .invalid) {
-                    try self.compiler.add_sem_error("unknown return type for function '{s}'", .{f.name}, .Error, f.result.token);
-                }
-                const fnty = try self.types.intern(.{ .function = .{ .params = param_tys, .result = rty } });
-                self.scope.declare(.{ .name = f.name, .kind = .func, .ty = fnty }) catch |e| {
-                    if (e == error.DuplicateName) {
-                        try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{f.name}, .Error, f.token);
-                    }
-                };
+                try self.declare_func(f, f.name);
                 try self.visit_function(f);
             },
             .proc => |*p| {
-                var param_tys = std.ArrayList(types.TypeId).empty;
-                for (p.params.items) |*param| {
-                    const pty = try self.types.resolve_type(param.type, self.scope);
-                    if (pty == .invalid) {
-                        try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
-                    }
-                    try param_tys.append(self.compiler.allocator, pty);
-                }
-                const prty = try self.types.intern(.{ .procedure = .{ .params = param_tys } });
-                self.scope.declare(.{ .name = p.name, .kind = .func, .ty = prty }) catch |e| {
-                    if (e == error.DuplicateName) {
-                        try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{p.name}, .Error, p.token);
-                    }
-                };
+                try self.declare_proc(p, p.name);
                 try self.visit_proc(p);
             },
-            .type_def => |t_def| {
+            .type_def => |*t_def| {
                 switch (t_def.variant) {
                     .struct_def => |*s| {
                         var field_tys = std.ArrayList(types.StFieldTy).empty;
@@ -126,7 +181,8 @@ pub const Sema = struct {
                             }
                         };
 
-                        try self.visit_struct_def(@constCast(s));
+                        try self.visit_struct_def(s);
+                        try self.visit_method(s);
                     },
                     .enum_def => |*en| {
                         var vartys = std.ArrayList(types.EnumVaraintTy).empty;
@@ -526,6 +582,97 @@ pub const Sema = struct {
         }
     }
 
+    // check if expression is lvalue or not
+    fn is_lvalue(e: *ast.Expr) bool {
+        return switch (e.*) {
+            .ident, .field_access, .index => true,
+            .unary => |u| u.op == .deref,
+            else => false,
+        };
+    }
+
+    // method is dot callable only if it's first param is the struct (owner)
+    fn takes_reciever(self: *Sema, fnty: types.TypeId, owner: types.TypeId) bool {
+        const params = switch (self.types.get(fnty).*) {
+            .function => |f| f.params.items,
+            .procedure => |p| p.params.items,
+            else => return false,
+        };
+        if (params.len == 0 or params[0] == .invalid) return false;
+        const p0 = params[0];
+        return p0 == owner or (self.types.get(p0).* == .pointer and self.types.get(p0).pointer.child == owner);
+    }
+
+    // auto & and auto * so reciever mathces the method's first param
+    fn reciever_arg(self: *Sema, target: *ast.Expr, tty: types.TypeId, fnty: types.TypeId) !*ast.Expr {
+        const first = switch (self.types.get(fnty).*) {
+            .function => |f| f.params.items[0],
+            .procedure => |p| p.params.items[0],
+            else => unreachable,
+        };
+        const wantsptr = self.types.get(first).* == .pointer;
+        const isptr = self.types.get(tty).* == .pointer;
+        if (wantsptr == isptr) return target;
+
+        if (wantsptr and target.* == .ident) {
+            if (self.scope.resolve(target.ident.name)) |sym| {
+                if (sym.kind == .constant) {
+                    try self.compiler.add_sem_error("cannot call pointer r-reciever method on constant '{s}'", .{sym.name}, .Error, target.token_of());
+                }
+            }
+        }
+        const e = try self.compiler.allocator.create(ast.Expr);
+        e.* = .{ .unary = .{ .op = if (wantsptr) .addr_of else .deref, .operand = target, .token = target.token_of() } };
+        return e;
+    }
+
+    // rewrite P.foo(a) into plain call to symbol "P.foo", so
+    // normal call checking does the method work too for us!
+    fn lower_method_call(self: *Sema, c: *ast.CallExpr) anyerror!bool {
+        const fa = c.callee.field_access;
+        const mname = switch (fa.field.*) {
+            .ident => |i| i.name,
+            else => return false,
+        };
+
+        var owner: types.TypeId = .invalid;
+        var tty: types.TypeId = .invalid;
+        const via_type = fa.target.* == .ident and blk: {
+            const sym = self.scope.resolve(fa.target.ident.name) orelse break :blk false;
+            if (sym.kind != .@"struct") break :blk false;
+            owner = sym.ty;
+            break :blk true;
+        };
+        if (!via_type) {
+            tty = try self.visit_expression(fa.target, null);
+            if (tty == .invalid) return true;
+            owner = self.struct_of(tty);
+            if (owner == .invalid) return false;
+        }
+
+        const qname = try self.qualify(self.types.get(owner).struct_ty.name, mname);
+        const sym = self.scope.resolve(qname) orelse {
+            if (!via_type) return false;
+            try self.compiler.add_sem_error("struct '{s}' has no method '{s}'", .{ self.types.name_of(owner), mname }, .Error, fa.token);
+            return true;
+        };
+
+        if (!via_type) {
+            if (!self.takes_reciever(sym.ty, owner)) {
+                try self.compiler.add_sem_error("'{s}' is a static method; call it as {s}.{s}(...)", .{ mname, self.types.name_of(owner), mname }, .Error, fa.token);
+                return true;
+            }
+            const recv = try self.reciever_arg(fa.target, tty, sym.ty);
+            try c.args.insert(self.compiler.allocator, 0, .{ .value = recv });
+        }
+
+        fa.field.deinit(self.compiler.allocator);
+        if (via_type) fa.target.deinit(self.compiler.allocator);
+
+        c.callee.* = .{ .ident = .{ .name = qname, .token = fa.token } };
+        return false;
+    }
+
     fn visit_expression(self: *Sema, expr: *ast.Expr, expected: ?types.TypeId) !types.TypeId {
         // std.debug.print("visiting expression\n", .{});
         const ty = switch (expr.*) {
@@ -644,8 +791,8 @@ pub const Sema = struct {
                         break :blk ty;
                     },
                     .addr_of => {
-                        if (u.operand.* != .ident) {
-                            try self.compiler.add_sem_error("cannot take address of non identifier expression", .{}, .Error, u.token);
+                        if (!is_lvalue(u.operand)) {
+                            try self.compiler.add_sem_error("cannot take address of a non-lvalue expression", .{}, .Error, u.token);
                             break :blk .invalid;
                         }
                         const innerty = try self.visit_expression(u.operand, null);
@@ -678,14 +825,7 @@ pub const Sema = struct {
                 const tty = try self.visit_expression(fa.target, null);
                 if (tty == .invalid) break :blk .invalid;
 
-                const stty = switch (self.types.get(tty).*) {
-                    .struct_ty => tty,
-                    .pointer => |p| switch (self.types.get(p.child).*) {
-                        .struct_ty => p.child,
-                        else => .invalid,
-                    },
-                    else => .invalid,
-                };
+                const stty = self.struct_of(tty);
 
                 switch (fa.field.*) {
                     .ident => |id| {
@@ -710,6 +850,7 @@ pub const Sema = struct {
                 const tmp = self.discard;
                 self.discard = false;
 
+                if (c.callee.* == .field_access and try self.lower_method_call(c)) break :blk .invalid;
                 const cty = try self.visit_expression(c.callee, null);
                 for (c.args.items) |arg| {
                     _ = try self.visit_expression(arg.value, null);
