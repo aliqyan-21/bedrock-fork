@@ -104,7 +104,7 @@ pub const Sema = struct {
     }
 
     // just turn struct and field to struct.field
-    fn qualify(self: *Sema, owner: []const u8, name: []const u8) ![]const u8 {
+    pub fn qualify(self: *Sema, owner: []const u8, name: []const u8) ![]const u8 {
         return std.fmt.allocPrint(self.types.arena.allocator(), "{s}.{s}", .{ owner, name });
     }
 
