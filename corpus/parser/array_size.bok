@@ -1,0 +1,9 @@
+// const or expr array size //
+
+const W = 1024;
+const H = 1024;
+
+func main() -> i32
+  var mem: [W * H]u32 = undefined;
+  return 0;
+end
