@@ -109,6 +109,7 @@ pub const TypeSystem = struct {
                 const cid = try self.resolve_type(a.elem, scope);
                 break :blk switch (a.size) {
                     .fixed => |d| self.intern(.{ .array = .{ .child = cid, .len = std.fmt.parseInt(u64, d, 10) catch return .invalid } }) catch return .invalid,
+                    .expr => .invalid,
                     .inferred => .invalid,
                 };
             },
