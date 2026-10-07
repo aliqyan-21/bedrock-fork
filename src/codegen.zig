@@ -1548,8 +1548,26 @@ pub const Codegen = struct {
         };
     }
 
+    fn codegen_addr_of(self: *Codegen, operand: *ast.Expr) anyerror!llvm.LLVMValueRef {
+        return switch (operand.*) {
+            .ident => |*i| self.stack_map.get(i.name) orelse self.global_map.get(i.name) orelse return error.VariableNotFound,
+            .field_access => |*f| try self.codegen_field_access(f, true),
+            .index => |*i| blk: {
+                const tty = self.expr_type(i.target);
+                break :blk switch (self.compiler.sema.types.get(tty).*) {
+                    .array => try self.codegen_array_index(i, tty, true),
+                    .slice => try self.codegen_slice_index(i, tty, true),
+                    else => return error.InvalidIndex,
+                };
+            },
+            .unary => |*u| if (u.op == .deref) try self.codegen_expression(u.operand) else return error.InvalidAddressOf,
+            else => return error.InvalidAddressOf,
+        };
+    }
+
     pub fn codegen_unary(self: *Codegen, u: *ast.UnaryExpr) anyerror!llvm.LLVMValueRef {
         if (u.op == .new) return self.codegen_new(u.operand);
+        if (u.op == .addr_of) return self.codegen_addr_of(u.operand);
 
         const e = try self.codegen_expression(u.operand);
         const oty = self.expr_type(u.operand);
@@ -1558,9 +1576,9 @@ pub const Codegen = struct {
         return switch (u.op) {
             .neg => if (is_float) llvm.LLVMBuildFNeg(self.builder, e, "neg_un") else llvm.LLVMBuildNeg(self.builder, e, "neg_un"),
             .bit_not => llvm.LLVMBuildNot(self.builder, e, "bit_not_un"),
-            .addr_of => switch (u.operand.*) {
-                .ident => |*i| self.stack_map.get(i.name).?,
-                else => unreachable,
+            .deref => blk: {
+                const child = self.compiler.sema.types.get(oty).pointer.child;
+                break :blk llvm.LLVMBuildLoad2(self.builder, try self.get_llvm_type_of(child), e, "");
             },
             .not => llvm.LLVMBuildNot(self.builder, e, "not_un"),
             else => {
