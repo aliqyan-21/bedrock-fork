@@ -24,6 +24,7 @@ pub const Symbol = struct {
     kind: SymbolKind,
     ty: types.TypeId = .invalid,
     has_self: bool = false, // self as first param (for struct)
+    const_val: ?u64 = null,
     // here we keep growing accordingly,
 };
 

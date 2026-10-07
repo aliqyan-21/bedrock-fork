@@ -107,6 +107,13 @@ pub const TypeSystem = struct {
             },
             .array => |*a| blk: {
                 const cid = try self.resolve_type(a.elem, scope);
+                // rewriting the ast here, evaluating the expr if we got expr as size
+                if (a.size == .expr) {
+                    const e = a.size.expr;
+                    const n = const_int(e, scope) orelse break :blk .invalid;
+                    e.deinit(self.allocator);
+                    a.size = .{ .fixed = try std.fmt.allocPrint(self.arena.allocator(), "{d}", .{n}) };
+                }
                 break :blk switch (a.size) {
                     .fixed => |d| self.intern(.{ .array = .{ .child = cid, .len = std.fmt.parseInt(u64, d, 10) catch return .invalid } }) catch return .invalid,
                     .expr => .invalid,
@@ -316,5 +323,31 @@ pub const TypeSystem = struct {
 
     pub fn resolve(self: *TypeSystem, name: []const u8) ?TypeId {
         return self.struct_reg.get(name);
+    }
+
+    // for constant expr evaluation at semantics stage
+    pub fn const_int(e: *ast.Expr, scope: *scope_mod.Scope) ?usize { // as it's for array size I am returning usize
+        switch (e.*) {
+            .literal => |l| return if (l.kind == .integer) l.ivalue else null,
+            .ident => |i| {
+                const sym = scope.resolve(i.name) orelse return null;
+                return if (sym.kind == .constant) sym.const_val else null;
+            },
+            .binary => |b| {
+                const l = const_int(b.lhs, scope) orelse return null;
+                const r = const_int(b.rhs, scope) orelse return null;
+                return switch (b.op) {
+                    .add => std.math.add(u64, l, r) catch null,
+                    .sub => std.math.sub(u64, l, r) catch null,
+                    .mul => std.math.mul(u64, l, r) catch null,
+                    .div => if (r == 0) null else l / r,
+                    .mod => if (r == 0) null else l % r,
+                    .shl => if (r >= 64) null else l << @intCast(r),
+                    .shr => if (r >= 64) null else l >> @intCast(r),
+                    else => null,
+                };
+            },
+            else => return null,
+        }
     }
 };
