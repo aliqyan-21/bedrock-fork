@@ -353,7 +353,10 @@ pub const Codegen = struct {
 
     pub fn codegen_typedef(self: *Codegen, t_def: *ast.TypeDef) !void {
         switch (t_def.*.variant) {
-            .struct_def => |*s| try self.codegen_struct_def(s),
+            .struct_def => |*s| {
+                try self.codegen_struct_def(s);
+                try self.codegen_methods(s);
+            },
             .enum_def => unreachable,
             .alias => {},
         }
@@ -377,6 +380,17 @@ pub const Codegen = struct {
         );
         try self.struct_types.put(s_def.name, s_ty);
         _ = llvm.LLVMStructCreateNamed(self.ctx, @ptrCast(name));
+    }
+
+    pub fn codegen_methods(self: *Codegen, s_def: *ast.StructDef) !void {
+        for (s_def.methods.items) |*m| switch (m.*) {
+            .func => |*f| _ = try self.declare_function(f, try self.compiler.sema.qualify(s_def.name, f.name)),
+            .proc => |*p| _ = try self.declare_proc(p, try self.compiler.sema.qualify(s_def.name, p.name)),
+        };
+        for (s_def.methods.items) |*m| switch (m.*) {
+            .func => |*f| try self.codegen_function(f, try self.compiler.sema.qualify(s_def.name, f.name)),
+            .proc => |*p| try self.codegen_proc(p, try self.compiler.sema.qualify(s_def.name, p.name)),
+        };
     }
 
     pub fn codegen_statements(self: *Codegen, stmts: std.ArrayList(ast.Stmt)) !llvm.LLVMBasicBlockRef {
