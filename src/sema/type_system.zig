@@ -71,16 +71,16 @@ pub const TypeSystem = struct {
 
     pub fn get(self: *TypeSystem, id: TypeId) *Type {
         std.debug.assert(id != .invalid);
-        return &self.types.items[@intFromEnum(id) - 1];
+        return &self.types.items[@backingInt(id) - 1];
     }
 
     pub fn add(self: *TypeSystem, ty: Type) !TypeId {
         try self.types.append(self.allocator, ty);
-        return @enumFromInt(self.types.items.len);
+        return @fromBackingInt(@intCast(self.types.items.len));
     }
 
     pub fn primitive(self: *TypeSystem, p: Primitive) !TypeId {
-        const idx = @intFromEnum(p);
+        const idx = @backingInt(p);
         if (self.pids[idx] != .invalid) {
             return self.pids[idx];
         }
@@ -170,7 +170,7 @@ pub const TypeSystem = struct {
                     .struct_ty => |*s| s.fields.deinit(self.allocator),
                     else => {},
                 }
-                return @enumFromInt(i + 1);
+                return @fromBackingInt(@intCast(i + 1));
             }
         }
         return self.add(ty);

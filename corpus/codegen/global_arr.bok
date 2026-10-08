@@ -1,0 +1,8 @@
+ // output: 63
+var arr: [3]i32 = undefined;
+
+func main() -> i32
+  arr = [21, 42, 63];
+  arr[1] += arr[0];
+  return arr[1];
+end

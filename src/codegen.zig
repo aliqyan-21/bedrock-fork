@@ -158,36 +158,95 @@ pub const Codegen = struct {
     }
 
     pub fn codegen_var_def(self: *Codegen, v: *ast.VarDef) !void {
-        const ty = if (v.type_ann) |a|
-            try self.get_type(a)
-        else
-            try self.get_llvm_type_of(self.expr_type(v.value));
+        switch (v.value.*) {
+            .array_literal => |a_lit| {
+                const ty = if (v.type_ann) |a|
+                    try self.get_type(a)
+                else
+                    try self.get_llvm_type_of(self.expr_type(v.value));
 
-        const name = try self.allocator.dupe(u8, v.name);
-        defer self.allocator.free(name);
+                const name = try self.allocator.dupe(u8, v.name);
+                defer self.allocator.free(name);
+                const global = llvm.LLVMAddGlobal(self.mod, ty, name.ptr);
 
-        const global = llvm.LLVMAddGlobal(self.mod, ty, name.ptr);
+                var values = try self.allocator.alloc(llvm.LLVMValueRef, a_lit.elements.items.len);
+                defer self.allocator.free(values);
+                for (a_lit.elements.items, 0..) |ele, idx| {
+                    const value = try self.codegen_expression(ele);
+                    values[idx] = value;
+                }
 
-        const init_val = try self.codegen_expression(v.value);
-        llvm.LLVMSetInitializer(global, init_val);
-        try self.global_map.put(v.name, global);
+                const arr = llvm.LLVMConstArray(llvm.LLVMGetElementType(ty), values.ptr, @intCast(values.len));
+                llvm.LLVMSetInitializer(global, arr);
+                try self.global_map.put(v.name, global);
+            },
+            else => {
+                const ty = if (v.type_ann) |a|
+                    try self.get_type(a)
+                else
+                    try self.get_llvm_type_of(self.expr_type(v.value));
+
+                const name = try self.allocator.dupe(u8, v.name);
+                defer self.allocator.free(name);
+                const global = llvm.LLVMAddGlobal(self.mod, ty, name.ptr);
+
+                if (v.value.* == .undefined) {
+                    const ud = llvm.LLVMConstNull(ty);
+                    llvm.LLVMSetInitializer(global, ud);
+                    try self.global_map.put(v.name, global);
+                } else {
+                    const e = try self.codegen_expression(v.value);
+                    llvm.LLVMSetInitializer(global, e);
+                    try self.global_map.put(v.name, global);
+                }
+            },
+        }
     }
 
     pub fn codegen_const_def(self: *Codegen, c: *ast.ConstDef) !void {
-        const ty = if (c.type_ann) |a|
-            try self.get_type(a)
-        else
-            try self.get_llvm_type_of(self.expr_type(c.value));
+        switch (c.value.*) {
+            .array_literal => |a_lit| {
+                const ty = if (c.type_ann) |a|
+                    try self.get_type(a)
+                else
+                    try self.get_llvm_type_of(self.expr_type(c.value));
 
-        const name = try self.allocator.dupe(u8, c.name);
-        defer self.allocator.free(name);
+                const name = try self.allocator.dupe(u8, c.name);
+                defer self.allocator.free(name);
+                const global = llvm.LLVMAddGlobal(self.mod, ty, name.ptr);
 
-        const global = llvm.LLVMAddGlobal(self.mod, ty, name.ptr);
+                var values = try self.allocator.alloc(llvm.LLVMValueRef, a_lit.elements.items.len);
+                defer self.allocator.free(values);
+                for (a_lit.elements.items, 0..) |ele, idx| {
+                    const value = try self.codegen_expression(ele);
+                    values[idx] = value;
+                }
 
-        const init_val = try self.codegen_expression(c.value);
-        llvm.LLVMSetInitializer(global, init_val);
-        llvm.LLVMSetGlobalConstant(global, 1);
-        try self.global_map.put(c.name, global);
+                const arr = llvm.LLVMConstArray(llvm.LLVMGetElementType(ty), values.ptr, @intCast(values.len));
+                llvm.LLVMSetInitializer(global, arr);
+                try self.global_map.put(c.name, global);
+            },
+            else => {
+                const ty = if (c.type_ann) |a|
+                    try self.get_type(a)
+                else
+                    try self.get_llvm_type_of(self.expr_type(c.value));
+
+                const name = try self.allocator.dupe(u8, c.name);
+                defer self.allocator.free(name);
+                const global = llvm.LLVMAddGlobal(self.mod, ty, name.ptr);
+
+                if (c.value.* == .undefined) {
+                    const ud = llvm.LLVMConstNull(ty);
+                    llvm.LLVMSetInitializer(global, ud);
+                    try self.global_map.put(c.name, global);
+                } else {
+                    const e = try self.codegen_expression(c.value);
+                    llvm.LLVMSetInitializer(global, e);
+                    try self.global_map.put(c.name, global);
+                }
+            },
+        }
     }
 
     pub fn codegen_function(self: *Codegen, function: *ast.FunctionDef) !void {
@@ -1186,7 +1245,7 @@ pub const Codegen = struct {
 
     pub fn codegen_array_index(self: *Codegen, i: *ast.IndexExpr, array_ty: types.TypeId, field_mem_access: bool) anyerror!llvm.LLVMValueRef {
         const arr = switch (i.target.*) {
-            .ident => |ident| self.stack_map.get(ident.name) orelse return error.UnknownVariable,
+            .ident => |ident| self.stack_map.get(ident.name) orelse self.global_map.get(ident.name) orelse return error.UnknownVariable,
 
             else => try self.codegen_expression(i.target),
         };
@@ -1238,13 +1297,17 @@ pub const Codegen = struct {
 
         // For now, array target must be an identifier.
         const arr = switch (i.target.*) {
-            .ident => |ident| self.stack_map.get(ident.name) orelse {
-                return error.UnknownVariable;
-            },
+            .ident => |ident| self.stack_map.get(ident.name) orelse self.global_map.get(ident.name) orelse
+                return error.UnknownVariable,
             else => return error.UnsupportedArrayTarget,
         };
 
-        const array_ty = llvm.LLVMGetAllocatedType(arr);
+        const target_ty = self.expr_type(i.target);
+        if (target_ty == .invalid) {
+            return error.InvalidType;
+        }
+
+        const array_ty = try self.get_llvm_type_of(target_ty);
         const index = try self.codegen_expression(i.args.items[0]);
         var indices = [2]llvm.LLVMValueRef{
             llvm.LLVMConstInt(llvm.LLVMInt64TypeInContext(self.ctx), 0, 0),

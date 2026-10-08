@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
 
     // build dir for compiler artifacts
     try std.Io.Dir.cwd().deleteTree(init.io, "./build");
-    try std.Io.Dir.cwd().createDir(init.io, "./build", @enumFromInt(0o777));
+    try std.Io.Dir.cwd().createDir(init.io, "./build", @fromBackingInt(@intCast(0o777)));
 
     const source = try std.Io.Dir.cwd().readFileAlloc(init.io, options.file, allocator, .limited(1 << 22));
     defer allocator.free(source);
