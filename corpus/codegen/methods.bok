@@ -13,8 +13,12 @@ type P = struct
   end
 end
 
+type Q = struct
+  p: P,
+end
+
 func main() -> i32
-  var p = P where x = 24, y = 44 end
-  p.bump();
-  return p.sum();
+  var q = Q where p = P where x = 24, y = 44 end end
+  q.p.bump();
+  return q.p.sum();
 end
