@@ -291,6 +291,9 @@ pub const Sema = struct {
                     }
                     break :blk t;
                 } else .invalid;
+                if (c.value.* == .undefined) {
+                    try self.compiler.add_sem_error("constant '{s}' cannot be 'undefined'", .{c.name}, .Error, c.token);
+                }
                 const aty = if (check_undefined_array_infer(c.type_ann, c.value)) blk: {
                     try self.compiler.add_sem_error("cannot infer array length: 'undefined' has no length to infer from", .{}, .Error, c.token);
                     break :blk .invalid;
@@ -425,6 +428,9 @@ pub const Sema = struct {
                     }
                     break :blk t;
                 } else .invalid;
+                if (c.value.* == .undefined) {
+                    try self.compiler.add_sem_error("constant '{s}' cannot be 'undefined'", .{c.name}, .Error, c.token);
+                }
                 const aty = if (check_undefined_array_infer(c.type_ann, c.value)) blk: {
                     try self.compiler.add_sem_error("cannot infer array length: 'undefined' has no length to infer from", .{}, .Error, c.token);
                     break :blk .invalid;
@@ -630,13 +636,6 @@ pub const Sema = struct {
         const isptr = self.types.get(tty).* == .pointer;
         if (wantsptr == isptr) return target;
 
-        if (wantsptr and target.* == .ident) {
-            if (self.scope.resolve(target.ident.name)) |sym| {
-                if (sym.kind == .constant) {
-                    try self.compiler.add_sem_error("cannot call pointer r-reciever method on constant '{s}'", .{sym.name}, .Error, target.token_of());
-                }
-            }
-        }
         const e = try self.compiler.allocator.create(ast.Expr);
         e.* = .{ .unary = .{ .op = if (wantsptr) .addr_of else .deref, .operand = target, .token = target.token_of() } };
         return e;
@@ -812,6 +811,11 @@ pub const Sema = struct {
                             break :blk .invalid;
                         }
                         const innerty = try self.visit_expression(u.operand, null);
+                        if (!self.expr_types.contains(expr)) {
+                            if (self.const_root(u.operand)) |name| {
+                                try self.compiler.add_sem_error("cannot take the address of constant '{s}'", .{name}, .Error, u.token);
+                            }
+                        }
                         break :blk if (innerty == .invalid) .invalid else try self.types.intern(.{ .pointer = .{ .child = innerty } });
                     },
                     .deref => {
