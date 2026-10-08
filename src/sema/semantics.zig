@@ -368,6 +368,30 @@ pub const Sema = struct {
         try self.enter_scope(proc.body.items, .block);
     }
 
+    // to find if the expression a place stored inline in an array for now
+    // todo: could be expanded to structs, slice, etc.
+    fn is_inline_value(self: *Sema, e: *ast.Expr) bool {
+        const t = self.expr_types.get(e) orelse return false;
+        if (t == .invalid) return false;
+        return switch (self.types.get(t).*) {
+            .array => true,
+            else => false,
+        };
+    }
+
+    // to find name of const owning this place
+    fn const_root(self: *Sema, e: *ast.Expr) ?[]const u8 {
+        return switch (e.*) {
+            .ident => |i| blk: {
+                const sym = self.scope.resolve(i.name) orelse break :blk null;
+                break :blk if (sym.kind == .constant) sym.name else null;
+            },
+            .field_access => |f| if (self.is_inline_value(f.target)) self.const_root(f.target) else null,
+            .index => |i| if (self.is_inline_value(i.target)) self.const_root(i.target) else null,
+            else => null,
+        };
+    }
+
     fn visit_statement(self: *Sema, stmt: *ast.Stmt) anyerror!void {
         // std.debug.print("visiting statement\n", .{});
         switch (stmt.*) {
@@ -437,18 +461,10 @@ pub const Sema = struct {
                 if (is_discard) {
                     _ = try self.visit_expression(a.value, null);
                 } else {
-                    switch (a.target.*) {
-                        .ident => |i| {
-                            if (self.scope.resolve(i.name)) |sym| {
-                                if (sym.kind == .constant) {
-                                    try self.compiler.add_sem_error("cannot assign to constant '{s}'", .{i.name}, .Error, a.token);
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-
                     const tty = try self.visit_expression(a.target, null);
+                    if (self.const_root(a.target)) |name| {
+                        try self.compiler.add_sem_error("cannot assign to constant '{s}'", .{name}, .Error, a.token);
+                    }
                     const vty = try self.visit_expression(a.value, if (tty != .invalid) tty else null);
                     if (tty != .invalid and vty != .invalid and !self.types.assignable(vty, tty)) {
                         try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(tty), self.types.name_of(vty) }, .Error, a.target.token_of());
