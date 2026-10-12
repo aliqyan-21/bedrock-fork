@@ -102,6 +102,8 @@ pub const Codegen = struct {
         self.break_targets.deinit(self.allocator);
         self.continue_targets.deinit(self.allocator);
         self.struct_types.deinit();
+        var it = self.enum_types.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
         self.enum_types.deinit();
     }
 
@@ -431,6 +433,7 @@ pub const Codegen = struct {
                 try self.codegen_struct_def(s);
                 try self.codegen_methods(s);
             },
+            // TODO: both var and const decl
             .enum_def => |*e| try self.codegen_enum(e),
             .alias => {},
         }
@@ -438,6 +441,7 @@ pub const Codegen = struct {
 
     pub fn codegen_enum(self: *Codegen, e_def: *ast.EnumDef) !void {
         // get the largest enum variant to allocate enough space
+        // TODO: multiple type variant
         var l_width: usize = 0;
         for (e_def.variants.items) |*ev| {
             if (ev.types.items.len > 0) {
@@ -449,13 +453,14 @@ pub const Codegen = struct {
                 for (ev.types.items, 1..) |t, idx| {
                     const ty = try self.get_type(t);
                     // const w_ty = llvm.LLVMGetByteTypeWidth(ty);
-                    const w_ty = llvm.LLVMGetIntTypeWidth(ty);
+                    const tar_data = llvm.LLVMGetModuleDataLayout(self.mod);
+                    const w_ty = llvm.LLVMABISizeOfType(tar_data, ty);
+                    // const w_ty = llvm.LLVMGetIntTypeWidth(ty);
                     if (w_ty > l_width) l_width = w_ty;
                     v_elems[idx] = ty;
                 }
                 // allocate for variant types
                 const name = try self.allocator.dupe(u8, ev.name);
-                defer self.allocator.free(name);
                 const v_ty = llvm.LLVMStructTypeInContext(self.ctx, v_elems.ptr, @intCast(ev.types.items.len + 1), 0);
                 llvm.LLVMDumpType(v_ty);
                 log.debug("", .{});
@@ -467,13 +472,11 @@ pub const Codegen = struct {
         if (l_width == 0) return;
         // allocate a range of bytes(i8), with alignment and padding
         const name = try self.allocator.dupe(u8, e_def.name);
-        defer self.allocator.free(name);
-
         const arr_ty = llvm.LLVMArrayType(llvm.LLVMInt8TypeInContext(self.ctx), @intCast(l_width));
         var elems: [2]llvm.LLVMTypeRef = .{ llvm.LLVMInt8TypeInContext(self.ctx), arr_ty };
         const e_ty = llvm.LLVMStructTypeInContext(self.ctx, @ptrCast(&elems), 2, 0);
         llvm.LLVMDumpType(e_ty);
-        log.debug("", .{});
+        log.debug("enum type registered: {s}", .{name});
         try self.enum_types.put(name, e_ty);
     }
 
@@ -1048,6 +1051,60 @@ pub const Codegen = struct {
                     try self.stack_map.put(v.name, alloca);
                     return alloca;
                 }
+
+                // enum handling
+                if (v.type_ann) |ann| {
+                    switch (ann.base) {
+                        .named => |n| {
+                            // check for enum types
+                            if (self.enum_types.get(n.name)) |enum_ty| {
+                                const name = try self.allocator.dupe(u8, n.name);
+                                defer self.allocator.free(name);
+                                const e_alloca = llvm.LLVMBuildAlloca(self.builder, enum_ty, @ptrCast(name));
+                                // pointer to the first element of type i8 (the tag)
+                                const tag_ptr = llvm.LLVMBuildStructGEP2(self.builder, enum_ty, e_alloca, 0, "");
+                                // get the variant
+                                var active: []const u8 = "";
+                                var idx: usize = 0;
+                                switch (v.value.*) {
+                                    .call => |*c| {
+                                        const id = c.callee.*.ident.name;
+                                        var e_it = std.mem.splitAny(u8, id, ".");
+                                        while (e_it.next()) |k| {
+                                            active = k;
+                                            idx += 1;
+                                        }
+                                        const var_ty = self.enum_types.get(active) orelse return error.NoEnumVariant;
+                                        // set the tag value
+                                        _ = llvm.LLVMBuildStore(
+                                            self.builder,
+                                            llvm.LLVMConstInt(llvm.LLVMInt8TypeInContext(self.ctx), @intCast(idx), 0),
+                                            tag_ptr,
+                                        );
+                                        const u_cast = llvm.LLVMBuildBitCast(
+                                            self.builder,
+                                            e_alloca,
+                                            llvm.LLVMPointerType(var_ty, 0),
+                                            "",
+                                        );
+                                        for (c.*.args.items) |*a| {
+                                            const u_exp = try self.codegen_expression(a.value);
+                                            const u_ptr = llvm.LLVMBuildStructGEP2(self.builder, var_ty, u_cast, 1, "");
+                                            _ = llvm.LLVMBuildStore(self.builder, u_exp, u_ptr);
+                                            // so later code can find the variable
+                                            try self.stack_map.put(v.name, e_alloca);
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        },
+
+                        else => {},
+                    }
+                    return null;
+                }
+
                 var e = try self.codegen_expression(v.value);
                 if (v.type_ann) |ann| {
                     if (ann.base == .primitive) {
@@ -1190,17 +1247,23 @@ pub const Codegen = struct {
                 // get the enum name by its name
                 const name = try self.allocator.dupe(u8, f_access.target.ident.name);
                 defer self.allocator.free(name);
-                const enum_ty = llvm.LLVMGetTypeByName2(self.ctx, name.ptr);
-                log.debug("access........", .{});
-                llvm.LLVMDumpType(enum_ty);
-                // const enum_info = target_type.enum_ty;
-                // for (enum_info.variants.items, 0..) |*ev, idx| {
-                //     if (std.mem.eql(u8, ev.name, f_access.field.*.ident.name)) {
-                //         const llvm_ty = try self.get_llvm_type_of(target_ty);
-                //         return llvm.LLVMConstInt(llvm_ty, idx, 0);
-                //     }
-                // }
-                // return error.UnknownEnumVariant;
+                if (self.stack_map.get(name)) |e_st| {
+                    const var_name = f_access.field.*.ident.name;
+                    const var_ty = self.enum_types.get(var_name) orelse return error.UnknownEnumVariant;
+                    const payload_ptr = llvm.LLVMBuildStructGEP2(self.builder, var_ty, e_st, 1, "");
+                    if (assign) return payload_ptr;
+                    const payload_ty = llvm.LLVMStructGetTypeAtIndex(var_ty, 1);
+                    return llvm.LLVMBuildLoad2(self.builder, payload_ty, payload_ptr, "");
+                } else {
+                    const enum_info = target_type.enum_ty;
+                    for (enum_info.variants.items, 0..) |*ev, idx| {
+                        if (std.mem.eql(u8, ev.name, f_access.field.*.ident.name)) {
+                            const llvm_ty = try self.get_llvm_type_of(target_ty);
+                            return llvm.LLVMConstInt(llvm_ty, idx, 0);
+                        }
+                    }
+                    return error.UnknownEnumVariant;
+                }
                 return null;
             },
             else => return error.InvalidFieldAccess,
