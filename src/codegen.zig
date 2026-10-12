@@ -24,6 +24,7 @@ pub const Codegen = struct {
     break_targets: std.ArrayList(llvm.LLVMBasicBlockRef),
     continue_targets: std.ArrayList(llvm.LLVMBasicBlockRef),
     struct_types: std.StringHashMap(llvm.LLVMTypeRef),
+    enum_types: std.StringHashMap(llvm.LLVMTypeRef),
 
     pub fn init(allocator: std.mem.Allocator, c: *compiler.Compiler) !Codegen {
         // initialize target machine and code emission
@@ -65,6 +66,7 @@ pub const Codegen = struct {
             .break_targets = .empty,
             .continue_targets = .empty,
             .struct_types = std.StringHashMap(llvm.LLVMTypeRef).init(allocator),
+            .enum_types = std.StringHashMap(llvm.LLVMTypeRef).init(allocator),
         };
 
         var target: llvm.LLVMTargetRef = undefined;
@@ -100,6 +102,7 @@ pub const Codegen = struct {
         self.break_targets.deinit(self.allocator);
         self.continue_targets.deinit(self.allocator);
         self.struct_types.deinit();
+        self.enum_types.deinit();
     }
 
     pub fn codegen_alloc_mem(self: *Codegen) !void {
@@ -428,9 +431,50 @@ pub const Codegen = struct {
                 try self.codegen_struct_def(s);
                 try self.codegen_methods(s);
             },
-            .enum_def => {},
+            .enum_def => |*e| try self.codegen_enum(e),
             .alias => {},
         }
+    }
+
+    pub fn codegen_enum(self: *Codegen, e_def: *ast.EnumDef) !void {
+        // get the largest enum variant to allocate enough space
+        var l_width: usize = 0;
+        for (e_def.variants.items) |*ev| {
+            if (ev.types.items.len > 0) {
+                const v_elems = try self.allocator.alloc(llvm.LLVMTypeRef, ev.types.items.len + 1);
+
+                defer self.allocator.free(v_elems);
+                // tagged variant with i8
+                v_elems[0] = llvm.LLVMInt8TypeInContext(self.ctx);
+                for (ev.types.items, 1..) |t, idx| {
+                    const ty = try self.get_type(t);
+                    // const w_ty = llvm.LLVMGetByteTypeWidth(ty);
+                    const w_ty = llvm.LLVMGetIntTypeWidth(ty);
+                    if (w_ty > l_width) l_width = w_ty;
+                    v_elems[idx] = ty;
+                }
+                // allocate for variant types
+                const name = try self.allocator.dupe(u8, ev.name);
+                defer self.allocator.free(name);
+                const v_ty = llvm.LLVMStructTypeInContext(self.ctx, v_elems.ptr, @intCast(ev.types.items.len + 1), 0);
+                llvm.LLVMDumpType(v_ty);
+                log.debug("", .{});
+                try self.enum_types.put(name, v_ty);
+            }
+        }
+
+        // c type simple enum
+        if (l_width == 0) return;
+        // allocate a range of bytes(i8), with alignment and padding
+        const name = try self.allocator.dupe(u8, e_def.name);
+        defer self.allocator.free(name);
+
+        const arr_ty = llvm.LLVMArrayType(llvm.LLVMInt8TypeInContext(self.ctx), @intCast(l_width));
+        var elems: [2]llvm.LLVMTypeRef = .{ llvm.LLVMInt8TypeInContext(self.ctx), arr_ty };
+        const e_ty = llvm.LLVMStructTypeInContext(self.ctx, @ptrCast(&elems), 2, 0);
+        llvm.LLVMDumpType(e_ty);
+        log.debug("", .{});
+        try self.enum_types.put(name, e_ty);
     }
 
     pub fn codegen_struct_def(self: *Codegen, s_def: *ast.StructDef) !void {
@@ -1143,14 +1187,21 @@ pub const Codegen = struct {
                 struct_ptr = try self.codegen_expression(f_access.target);
             },
             .enum_ty => {
-                const enum_info = target_type.enum_ty;
-                for (enum_info.variants.items, 0..) |*ev, idx| {
-                    if (std.mem.eql(u8, ev.name, f_access.field.*.ident.name)) {
-                        const llvm_ty = try self.get_llvm_type_of(target_ty);
-                        return llvm.LLVMConstInt(llvm_ty, idx, 0);
-                    }
-                }
-                return error.UnknownEnumVariant;
+                // get the enum name by its name
+                const name = try self.allocator.dupe(u8, f_access.target.ident.name);
+                defer self.allocator.free(name);
+                const enum_ty = llvm.LLVMGetTypeByName2(self.ctx, name.ptr);
+                log.debug("access........", .{});
+                llvm.LLVMDumpType(enum_ty);
+                // const enum_info = target_type.enum_ty;
+                // for (enum_info.variants.items, 0..) |*ev, idx| {
+                //     if (std.mem.eql(u8, ev.name, f_access.field.*.ident.name)) {
+                //         const llvm_ty = try self.get_llvm_type_of(target_ty);
+                //         return llvm.LLVMConstInt(llvm_ty, idx, 0);
+                //     }
+                // }
+                // return error.UnknownEnumVariant;
+                return null;
             },
             else => return error.InvalidFieldAccess,
         }
