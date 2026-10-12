@@ -6,6 +6,6 @@ type Foo = enum
 end
 
 func main() -> i32
-    //var f: Foo = Foo.a_u32(10);
+    var f: Foo = Foo.a_u32(10);
     return 10;
 end
