@@ -1,0 +1,22 @@
+// output: 64
+extern func printf(fmt: str, ...) -> i32;
+
+type Foo = enum
+    a_bool(bool),
+    a_u32(u32),
+    a_u64(u64),
+    a_str(str),
+end
+
+func main() -> u64
+    var f1: Foo = Foo.a_bool(true);
+    var f2: Foo = Foo.a_u32(32);
+    var f3: Foo = Foo.a_u64(64);
+    var f4: Foo = Foo.a_str("bokbok");
+    const r1 = f1.a_bool;
+    const r2 = f2.a_u32;
+    const r3 = f3.a_u64;
+    const r4 = f4.a_str;
+    _ = printf("%s\n", r4);
+    return r3;
+end

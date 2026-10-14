@@ -204,6 +204,16 @@ pub const Sema = struct {
                         self.scope.declare(.{ .name = en.name, .kind = .@"enum", .ty = ety }) catch |e| {
                             if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate declaration: {s}", .{en.name}, .Error, en.token);
                         };
+                        const edef = self.types.get(ety).enum_ty;
+                        for (edef.variants.items) |v| {
+                            const ctorty = try self.types.intern(.{ .function = .{
+                                .params = try v.types.clone(self.compiler.allocator),
+                                .result = ety,
+                            } });
+                            self.scope.declare(.{ .name = try self.qualify(en.name, v.name), .kind = .enum_variant, .ty = ctorty }) catch |e| {
+                                if (e != error.DuplicateName) return e;
+                            };
+                        }
                     },
                     .alias => |*a| {
                         const aty = try self.types.resolve_type(a.ty, self.scope);
@@ -654,7 +664,7 @@ pub const Sema = struct {
         var tty: types.TypeId = .invalid;
         const via_type = fa.target.* == .ident and blk: {
             const sym = self.scope.resolve(fa.target.ident.name) orelse break :blk false;
-            if (sym.kind != .@"struct") break :blk false;
+            if (sym.kind != .@"struct" and sym.kind != .@"enum") break :blk false;
             owner = sym.ty;
             break :blk true;
         };
@@ -665,10 +675,14 @@ pub const Sema = struct {
             if (owner == .invalid) return false;
         }
 
-        const qname = try self.qualify(self.types.get(owner).struct_ty.name, mname);
+        const qname = try self.qualify(self.types.name_of(owner), mname);
         const sym = self.scope.resolve(qname) orelse {
             if (!via_type) return false;
-            try self.compiler.add_sem_error("struct '{s}' has no method '{s}'", .{ self.types.name_of(owner), mname }, .Error, fa.token);
+            if (self.types.get(owner).* == .enum_ty) {
+                try self.compiler.add_sem_error("enum '{s}' has no variant '{s}'", .{ self.types.name_of(owner), mname }, .Error, fa.token);
+            } else {
+                try self.compiler.add_sem_error("struct '{s}' has no method '{s}'", .{ self.types.name_of(owner), mname }, .Error, fa.token);
+            }
             return true;
         };
 
@@ -865,7 +879,27 @@ pub const Sema = struct {
                         } else if (target_ty == .enum_ty) {
                             const edef = self.types.get(stty).enum_ty;
                             for (edef.variants.items) |ef| {
-                                if (std.mem.eql(u8, ef.name, id.name)) break :blk tty;
+                                if (!std.mem.eql(u8, ef.name, id.name)) continue;
+                                // if target is enum variant then it's enum
+                                const via_type = fa.target.* == .ident and blk2: {
+                                    const s = self.scope.resolve(fa.target.ident.name) orelse break :blk2 false;
+                                    break :blk2 s.kind == .@"enum";
+                                };
+                                if (via_type) break :blk tty;
+
+                                // if payload then we take type off it
+                                switch (ef.types.items.len) {
+                                    0 => {
+                                        try self.compiler.add_sem_error("variant '{s}' of enum '{s}' has no payload to read", .{ ef.name, edef.name }, .Error, fa.token);
+                                        break :blk .invalid;
+                                    },
+                                    1 => break :blk ef.types.items[0],
+                                    else => {
+                                        // todo: could implement destructarizing multiple fields in multiple vars
+                                        try self.compiler.add_sem_error("variant '{s}' carries {d} values and can't be read as a single field", .{ ef.name, ef.types.items.len }, .Error, fa.token);
+                                        break :blk .invalid;
+                                    },
+                                }
                             }
                             try self.compiler.add_sem_error("enum '{s}' has no field '{s}'", .{ edef.name, id.name }, .Error, fa.token);
                             break :blk .invalid;
