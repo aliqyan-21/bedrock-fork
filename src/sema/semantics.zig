@@ -879,7 +879,27 @@ pub const Sema = struct {
                         } else if (target_ty == .enum_ty) {
                             const edef = self.types.get(stty).enum_ty;
                             for (edef.variants.items) |ef| {
-                                if (std.mem.eql(u8, ef.name, id.name)) break :blk tty;
+                                if (!std.mem.eql(u8, ef.name, id.name)) continue;
+                                // if target is enum variant then it's enum
+                                const via_type = fa.target.* == .ident and blk2: {
+                                    const s = self.scope.resolve(fa.target.ident.name) orelse break :blk2 false;
+                                    break :blk2 s.kind == .@"enum";
+                                };
+                                if (via_type) break :blk tty;
+
+                                // if payload then we take type off it
+                                switch (ef.types.items.len) {
+                                    0 => {
+                                        try self.compiler.add_sem_error("variant '{s}' of enum '{s}' has no payload to read", .{ ef.name, edef.name }, .Error, fa.token);
+                                        break :blk .invalid;
+                                    },
+                                    1 => break :blk ef.types.items[0],
+                                    else => {
+                                        // todo: could implement destructarizing multiple fields in multiple vars
+                                        try self.compiler.add_sem_error("variant '{s}' carries {d} values and can't be read as a single field", .{ ef.name, ef.types.items.len }, .Error, fa.token);
+                                        break :blk .invalid;
+                                    },
+                                }
                             }
                             try self.compiler.add_sem_error("enum '{s}' has no field '{s}'", .{ edef.name, id.name }, .Error, fa.token);
                             break :blk .invalid;

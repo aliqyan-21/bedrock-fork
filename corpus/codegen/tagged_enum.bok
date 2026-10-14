@@ -1,5 +1,5 @@
-// output: 32
-extern proc printf(fmt: str, ...);
+// output: 64
+extern func printf(fmt: str, ...) -> i32;
 
 type Foo = enum
     a_bool(bool),
@@ -8,7 +8,7 @@ type Foo = enum
     a_str(str),
 end
 
-func main() -> Foo
+func main() -> u64
     var f1: Foo = Foo.a_bool(true);
     var f2: Foo = Foo.a_u32(32);
     var f3: Foo = Foo.a_u64(64);
@@ -17,6 +17,6 @@ func main() -> Foo
     const r2 = f2.a_u32;
     const r3 = f3.a_u64;
     const r4 = f4.a_str;
-    printf("%s\n", r4);
-    return r2;
+    _ = printf("%s\n", r4);
+    return r3;
 end

@@ -25,6 +25,7 @@ pub const Codegen = struct {
     continue_targets: std.ArrayList(llvm.LLVMBasicBlockRef),
     struct_types: std.StringHashMap(llvm.LLVMTypeRef),
     enum_types: std.StringHashMap(llvm.LLVMTypeRef),
+    enum_tag: std.StringHashMap(usize),
 
     pub fn init(allocator: std.mem.Allocator, c: *compiler.Compiler) !Codegen {
         // initialize target machine and code emission
@@ -67,6 +68,7 @@ pub const Codegen = struct {
             .continue_targets = .empty,
             .struct_types = std.StringHashMap(llvm.LLVMTypeRef).init(allocator),
             .enum_types = std.StringHashMap(llvm.LLVMTypeRef).init(allocator),
+            .enum_tag = std.StringHashMap(usize).init(allocator),
         };
 
         var target: llvm.LLVMTargetRef = undefined;
@@ -105,6 +107,7 @@ pub const Codegen = struct {
         var it = self.enum_types.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.enum_types.deinit();
+        self.enum_tag.deinit();
     }
 
     pub fn codegen_alloc_mem(self: *Codegen) !void {
@@ -443,7 +446,7 @@ pub const Codegen = struct {
         // get the largest enum variant to allocate enough space
         // TODO: multiple type variant
         var l_width: usize = 0;
-        for (e_def.variants.items) |*ev| {
+        for (e_def.variants.items, 0..) |*ev, i| {
             if (ev.types.items.len > 0) {
                 const v_elems = try self.allocator.alloc(llvm.LLVMTypeRef, ev.types.items.len + 1);
 
@@ -465,6 +468,7 @@ pub const Codegen = struct {
                 llvm.LLVMDumpType(v_ty);
                 log.debug("", .{});
                 try self.enum_types.put(name, v_ty);
+                try self.enum_tag.put(name, i);
             }
         }
 
@@ -478,6 +482,72 @@ pub const Codegen = struct {
         llvm.LLVMDumpType(e_ty);
         log.debug("enum type registered: {s}", .{name});
         try self.enum_types.put(name, e_ty);
+    }
+
+    pub fn codegen_tagged_enum(self: *Codegen, v: anytype, n: *ast.NamedType) !llvm.LLVMValueRef {
+        // check for enum types
+        if (self.enum_types.get(n.name)) |enum_ty| {
+            const name = try self.allocator.dupe(u8, n.name);
+            defer self.allocator.free(name);
+            const e_alloca = llvm.LLVMBuildAlloca(self.builder, enum_ty, @ptrCast(name));
+            // pointer to the first element of type i8 (the tag)
+            const tag_ptr = llvm.LLVMBuildStructGEP2(self.builder, enum_ty, e_alloca, 0, "");
+            // get the variant
+            var active: []const u8 = "";
+            switch (v.value.*) {
+                .call => |*c| {
+                    const id = c.callee.*.ident.name;
+                    // TODO: fix this spliting workaround with normal target and field type
+                    var e_it = std.mem.splitAny(u8, id, ".");
+                    while (e_it.next()) |k| active = k;
+                    const var_ty = self.enum_types.get(active) orelse return error.NoEnumVariant;
+                    const var_tag = self.enum_tag.get(active) orelse return error.NoEnumVariant;
+                    // set the tag value
+                    _ = llvm.LLVMBuildStore(
+                        self.builder,
+                        llvm.LLVMConstInt(llvm.LLVMInt8TypeInContext(self.ctx), @intCast(var_tag), 0),
+                        tag_ptr,
+                    );
+                    const u_cast = llvm.LLVMBuildBitCast(
+                        self.builder,
+                        e_alloca,
+                        llvm.LLVMPointerType(var_ty, 0),
+                        "",
+                    );
+                    for (c.*.args.items) |*a| {
+                        const u_exp = try self.codegen_expression(a.value);
+                        const u_ptr = llvm.LLVMBuildStructGEP2(self.builder, var_ty, u_cast, 1, "");
+                        _ = llvm.LLVMBuildStore(self.builder, u_exp, u_ptr);
+                        // so later code can find the variable
+                        try self.stack_map.put(v.name, e_alloca);
+                    }
+                },
+                else => unreachable,
+            }
+        } else {
+            // c type enum
+            const alloca = if (@TypeOf(v) == *ast.VarStmt)
+                try self.codegen_alloca_var(v)
+            else
+                try self.codegen_alloca_const(v);
+            if (v.value.* == .undefined) {
+                try self.stack_map.put(v.name, alloca);
+                return alloca;
+            }
+            var e = try self.codegen_expression(v.value);
+            if (v.type_ann) |ann| {
+                if (ann.base == .primitive) {
+                    const target_ty = try self.compiler.sema.types.from_ast_primitive(ann.base.primitive);
+                    e = try self.coerce_numeric(e, self.expr_type(v.value), target_ty);
+                }
+            }
+            // store value on stack space
+            _ = llvm.LLVMBuildStore(self.builder, e, alloca);
+            try self.stack_map.put(v.name, alloca);
+            return e;
+        }
+
+        return null;
     }
 
     pub fn codegen_struct_def(self: *Codegen, s_def: *ast.StructDef) !void {
@@ -1046,65 +1116,19 @@ pub const Codegen = struct {
                 return s;
             },
             else => {
+                // enum handling
+                if (v.type_ann) |ann| {
+                    switch (ann.base) {
+                        .named => |*n| return try self.codegen_tagged_enum(v, n),
+                        else => {},
+                    }
+                }
+
                 const alloca = try self.codegen_alloca_var(v);
                 if (v.value.* == .undefined) {
                     try self.stack_map.put(v.name, alloca);
                     return alloca;
                 }
-
-                // enum handling
-                if (v.type_ann) |ann| {
-                    switch (ann.base) {
-                        .named => |n| {
-                            // check for enum types
-                            if (self.enum_types.get(n.name)) |enum_ty| {
-                                const name = try self.allocator.dupe(u8, n.name);
-                                defer self.allocator.free(name);
-                                const e_alloca = llvm.LLVMBuildAlloca(self.builder, enum_ty, @ptrCast(name));
-                                // pointer to the first element of type i8 (the tag)
-                                const tag_ptr = llvm.LLVMBuildStructGEP2(self.builder, enum_ty, e_alloca, 0, "");
-                                // get the variant
-                                var active: []const u8 = "";
-                                var idx: usize = 0;
-                                switch (v.value.*) {
-                                    .call => |*c| {
-                                        const id = c.callee.*.ident.name;
-                                        var e_it = std.mem.splitAny(u8, id, ".");
-                                        while (e_it.next()) |k| {
-                                            active = k;
-                                            idx += 1;
-                                        }
-                                        const var_ty = self.enum_types.get(active) orelse return error.NoEnumVariant;
-                                        // set the tag value
-                                        _ = llvm.LLVMBuildStore(
-                                            self.builder,
-                                            llvm.LLVMConstInt(llvm.LLVMInt8TypeInContext(self.ctx), @intCast(idx), 0),
-                                            tag_ptr,
-                                        );
-                                        const u_cast = llvm.LLVMBuildBitCast(
-                                            self.builder,
-                                            e_alloca,
-                                            llvm.LLVMPointerType(var_ty, 0),
-                                            "",
-                                        );
-                                        for (c.*.args.items) |*a| {
-                                            const u_exp = try self.codegen_expression(a.value);
-                                            const u_ptr = llvm.LLVMBuildStructGEP2(self.builder, var_ty, u_cast, 1, "");
-                                            _ = llvm.LLVMBuildStore(self.builder, u_exp, u_ptr);
-                                            // so later code can find the variable
-                                            try self.stack_map.put(v.name, e_alloca);
-                                        }
-                                    },
-                                    else => {},
-                                }
-                            }
-                        },
-
-                        else => {},
-                    }
-                    return null;
-                }
-
                 var e = try self.codegen_expression(v.value);
                 if (v.type_ann) |ann| {
                     if (ann.base == .primitive) {
@@ -1140,6 +1164,14 @@ pub const Codegen = struct {
                 return s;
             },
             else => {
+                // enum handling
+                if (v.type_ann) |ann| {
+                    switch (ann.base) {
+                        .named => |*n| return try self.codegen_tagged_enum(v, n),
+                        else => {},
+                    }
+                }
+
                 const alloca = try self.codegen_alloca_const(v);
                 if (v.value.* == .undefined) {
                     try self.stack_map.put(v.name, alloca);
