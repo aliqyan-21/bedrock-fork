@@ -643,11 +643,55 @@ pub const Codegen = struct {
             .if_expr => |*i| return try self.codegen_if(i),
             .while_expr => |*w| return try self.codegen_while(w),
             .for_expr => |*f| return try self.codegen_for(f),
-            else => {
-                // TODO:
-                unreachable;
-            },
+            .match_expr => |*m| return try self.codegen_match(m),
         }
+    }
+
+    pub fn codegen_match(self: *Codegen, m: *ast.MatchExpr) !llvm.LLVMValueRef {
+        const func = llvm.LLVMGetBasicBlockParent(self.entry);
+        const sub = try self.codegen_expression(m.subject);
+        const sub_ty = llvm.LLVMTypeOf(sub);
+
+        const default_bb = llvm.LLVMAppendBasicBlockInContext(self.ctx, func, "");
+        const merge_bb = llvm.LLVMAppendBasicBlockInContext(self.ctx, func, "");
+
+        const arm_bbs = try self.allocator.alloc(llvm.LLVMBasicBlockRef, m.arms.items.len);
+        defer self.allocator.free(arm_bbs);
+
+        const sw = llvm.LLVMBuildSwitch(self.builder, sub, default_bb, @intCast(m.arms.items.len));
+        for (m.arms.items, 0..) |*arm, i| {
+            arm_bbs[i] = llvm.LLVMAppendBasicBlockInContext(self.ctx, func, "match_arm");
+            const case_val = try self.codegen_match_pattern(&arm.pattern, sub_ty);
+            llvm.LLVMAddCase(sw, case_val, arm_bbs[i]);
+        }
+
+        // else
+        llvm.LLVMPositionBuilderAtEnd(self.builder, default_bb);
+        if (m.else_body) |body| {
+            _ = try self.codegen_statements(body);
+        }
+        if (llvm.LLVMGetBasicBlockTerminator(llvm.LLVMGetInsertBlock(self.builder)) == null) {
+            _ = llvm.LLVMBuildBr(self.builder, merge_bb);
+        }
+
+        llvm.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
+        return null;
+    }
+
+    fn codegen_match_pattern(self: *Codegen, p: *ast.Pattern, subject_ty: llvm.LLVMTypeRef) !llvm.LLVMValueRef {
+        return switch (p.*) {
+            .integer => |s| blk: {
+                const v = try std.fmt.parseInt(i64, s, 0);
+                break :blk llvm.LLVMConstInt(subject_ty, @bitCast(v), 1);
+            },
+            .boolean => |b| llvm.LLVMConstInt(subject_ty, @intFromBool(b), 0),
+            .field_variant => |e| blk: {
+                const v = try self.codegen_expression(e);
+                if (llvm.LLVMIsConstant(v) == 0) return error.NonConstantPattern;
+                break :blk v;
+            },
+            else => error.UnsupportedPattern,
+        };
     }
 
     pub fn codegen_while(self: *Codegen, w: *ast.WhileExpr) !llvm.LLVMValueRef {

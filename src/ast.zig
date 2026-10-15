@@ -1070,6 +1070,7 @@ pub const Pattern = union(enum) {
     integer: []const u8,
     boolean: bool,
     ident: []const u8,
+    field_variant: *Expr,
     variant: VariantPattern,
 
     pub fn print(self: *Pattern, indent: usize) anyerror!void {
@@ -1078,12 +1079,14 @@ pub const Pattern = union(enum) {
             .integer => |*i| std.debug.print("pattern integer: {s}\n", .{i.*}),
             .boolean => |*b| std.debug.print("pattern boolean: {}\n", .{b.*}),
             .ident => |*id| std.debug.print("pattern ident: {s}\n", .{id.*}),
+            .field_variant => |*f| try f.*.print(indent),
             .variant => |*v| try v.print(indent + 4),
         }
     }
 
     pub fn deinit(self: *Pattern, allocator: std.mem.Allocator) void {
         switch (self.*) {
+            .field_variant => |*f| f.*.deinit(allocator),
             .variant => |*v| v.deinit(allocator),
             else => {},
         }

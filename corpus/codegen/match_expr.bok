@@ -1,0 +1,30 @@
+// output: 4
+
+extern func printf(fmt: str, ...) -> i32;
+
+type Color = enum
+    green,
+    red,
+    blue,
+    yellow,
+    pink,
+    white,
+    black,
+    brown,
+end
+
+func main() -> Color
+    const c: Color = Color.pink;
+    match c
+        case Color.pink
+            _ = printf("Color is pink\n");
+        case Color.green
+            _ = printf("Color is green\n");
+        case Color.red
+            _ = printf("Color is red\n");
+        else
+            _ = printf("Choose you fav color\n");
+    end
+
+    return c;
+end

@@ -1,5 +1,7 @@
 // output: 4
 
+extern func printf(fmt: str, ...) -> i32;
+
 type Color = enum
     green,
     red,
@@ -13,5 +15,9 @@ end
 
 func main() -> Color
     const c: Color = Color.pink;
+    if (c == Color.pink)
+        _ = printf("Color is pink\n");
+    end
+
     return c;
 end
