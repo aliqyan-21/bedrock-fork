@@ -47,15 +47,19 @@ enum_variant   = IDENT [ "(" type_list ")" ]
 statement       = var_stmt | local_static_var_stmt | assign_stmt | defer_stmt
                 | unsafe_stmt | control_flow_stmt | return_stmt | expr_stmt
 
-var_stmt        = "var" IDENT [ ":" type ] "=" expression ";"
+declarator            = IDENT [ ":" type ] "=" expression
+declarator_list       = declarator { "," declarator }
+
+var_stmt        = "var" declarator_list ";"
+const_stmt        = "const" declarator_list ";"
 assign_stmt     = place_expr ( "=" | compound_op ) expression ";"
 
-var_def  = [ "pub" ] "var" IDENT [ ":" type ] "=" expression ";"
+var_def  = [ "pub" ] "var" declarator_list ";"
 
 # like c, does not change value in simultanous calls.
-local_static_var_stmt = "static" "var" IDENT [ ":" type ] "=" expression ";"
+local_static_var_stmt = "static" "var" declarator_list ";"
 
-const_def       = [ "pub" ] "const" IDENT [ ":" type ] "=" expression ";"
+const_def       = [ "pub" ] "const" declarator_list ";"
 
 place_expr      = "*" "(" expression ")"
                 | "*" IDENT
