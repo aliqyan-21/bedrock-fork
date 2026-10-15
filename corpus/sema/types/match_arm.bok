@@ -1,0 +1,14 @@
+proc main()
+  var a = 10;
+  var b = 0;
+
+  match a
+    case true // this will error as pattern is bool but match is integer
+      b = 1;
+  end
+
+  match true
+    case 1 // this will error as pattern is integer but match is bool
+      b = 1;
+  end
+end

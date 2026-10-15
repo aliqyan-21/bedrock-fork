@@ -547,6 +547,19 @@ pub const Sema = struct {
         }
     }
 
+    fn visit_pattern(self: *Sema, pat: *ast.Pattern, sty: types.TypeId, tok: Token) !void {
+        if (sty == .invalid) return;
+        switch (pat.*) {
+            .integer => if (!self.types.literal_fits(.integer, sty)) {
+                try self.compiler.add_sem_error("integer pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, tok);
+            },
+            .boolean => if (!self.types.assignable(try self.types.primitive(.bool), sty)) {
+                try self.compiler.add_sem_error("bool pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, tok);
+            },
+            else => {}, // TODO
+        }
+    }
+
     fn visit_control_flow(self: *Sema, stmt: *ast.ControlFlowStmt) !void {
         // std.debug.print("visiting control flow\n", .{});
         switch (stmt.*) {
@@ -563,8 +576,10 @@ pub const Sema = struct {
             },
             .match_expr => |*m| {
                 _ = try self.visit_expression(m.subject, null);
+                const sty = try self.visit_expression(m.subject, null);
 
                 for (m.arms.items) |*arm| {
+                    try self.visit_pattern(&arm.pattern, sty, arm.token);
                     try self.enter_scope(arm.body.items, .block);
                 }
 
