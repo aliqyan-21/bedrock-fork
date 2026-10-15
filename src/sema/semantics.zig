@@ -557,7 +557,7 @@ pub const Sema = struct {
                 try self.compiler.add_sem_error("bool pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, tok);
             },
             .variant => |*v| try self.visit_variant_pattern(v, sty),
-            else => {}, // TODO
+            .field_variant => |expr| try self.visit_field_variant_pattern(expr, sty),
             else => {
                 try pat.print(0);
             }, // TODO
@@ -591,6 +591,49 @@ pub const Sema = struct {
         }
         try self.compiler.add_sem_error("enum '{s}' has no variant '{s}'", .{ edef.name, vname }, .Error, v.token);
     }
+
+    fn visit_field_variant_pattern(self: *Sema, expr: *ast.Expr, sty: types.TypeId) !void {
+        if (self.types.get(sty).* != .enum_ty) {
+            try self.compiler.add_sem_error("variant pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, expr.token_of());
+            return;
+        }
+        const edef = self.types.get(sty).enum_ty;
+
+        if (expr.* != .field_access) return;
+        const fa = expr.field_access;
+
+        const ename = switch (fa.target.*) {
+            .ident => |i| i.name,
+            else => {
+                try self.compiler.add_sem_error("expected enum name before '.'", .{}, .Error, fa.token);
+                return;
+            },
+        };
+
+        const vname = switch (fa.field.*) {
+            .ident => |i| i.name,
+            else => {
+                try self.compiler.add_sem_error("expected variant name after '.'", .{}, .Error, fa.token);
+                return;
+            },
+        };
+
+        const sym = self.scope.resolve(ename) orelse {
+            try self.compiler.add_sem_error("Unknown identifier: '{s}'", .{ename}, .Error, fa.token);
+            return;
+        };
+
+        if ((sym.kind != .@"enum" and sym.kind != .type_alias) or sym.ty != sty) {
+            try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(sty), ename }, .Error, fa.token);
+            return;
+        }
+
+        for (edef.variants.items) |ev| {
+            if (std.mem.eql(u8, ev.name, vname)) return;
+        }
+        try self.compiler.add_sem_error("enum '{s}' has no variant '{s}'", .{ edef.name, vname }, .Error, fa.token);
+    }
+
     fn visit_control_flow(self: *Sema, stmt: *ast.ControlFlowStmt) !void {
         // std.debug.print("visiting control flow\n", .{});
         switch (stmt.*) {
