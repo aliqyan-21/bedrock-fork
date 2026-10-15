@@ -556,10 +556,41 @@ pub const Sema = struct {
             .boolean => if (!self.types.assignable(try self.types.primitive(.bool), sty)) {
                 try self.compiler.add_sem_error("bool pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, tok);
             },
+            .variant => |*v| try self.visit_variant_pattern(v, sty),
             else => {}, // TODO
+            else => {
+                try pat.print(0);
+            }, // TODO
         }
     }
 
+    fn visit_variant_pattern(self: *Sema, v: *ast.VariantPattern, sty: types.TypeId) !void {
+        std.debug.print("am I here\n", .{});
+        if (self.types.get(sty).* != .enum_ty) {
+            try self.compiler.add_sem_error("variant pattern '{s}' can't match a value of type  {s}", .{ v.name, self.types.name_of(sty) }, .Error, v.token);
+            return;
+        }
+        const edef = self.types.get(sty).enum_ty;
+        var vname = v.name;
+        if (std.mem.lastIndexOfScalar(u8, v.name, '.')) |dot| {
+            vname = v.name[dot + 1 ..];
+            const ename = v.name[0..dot];
+            const sym = self.scope.resolve(ename) orelse {
+                try self.compiler.add_sem_error("Unknown identifier: '{s}'", .{ename}, .Error, v.token);
+                return;
+            };
+            if ((sym.kind != .@"enum" and sym.kind != .type_alias) or sym.ty != sty) {
+                try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(sty), ename }, .Error, v.token);
+                return;
+            }
+        }
+
+        for (edef.variants.items) |ev| {
+            if (!std.mem.eql(u8, ev.name, vname)) continue;
+            return;
+        }
+        try self.compiler.add_sem_error("enum '{s}' has no variant '{s}'", .{ edef.name, vname }, .Error, v.token);
+    }
     fn visit_control_flow(self: *Sema, stmt: *ast.ControlFlowStmt) !void {
         // std.debug.print("visiting control flow\n", .{});
         switch (stmt.*) {
@@ -575,7 +606,6 @@ pub const Sema = struct {
                 }
             },
             .match_expr => |*m| {
-                _ = try self.visit_expression(m.subject, null);
                 const sty = try self.visit_expression(m.subject, null);
 
                 for (m.arms.items) |*arm| {
