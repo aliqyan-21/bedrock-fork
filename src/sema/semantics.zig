@@ -559,13 +559,12 @@ pub const Sema = struct {
             .variant => |*v| try self.visit_variant_pattern(v, sty),
             .field_variant => |expr| try self.visit_field_variant_pattern(expr, sty),
             else => {
-                try pat.print(0);
+                // try pat.print(0);
             }, // TODO
         }
     }
 
     fn visit_variant_pattern(self: *Sema, v: *ast.VariantPattern, sty: types.TypeId) !void {
-        std.debug.print("am I here\n", .{});
         if (self.types.get(sty).* != .enum_ty) {
             try self.compiler.add_sem_error("variant pattern '{s}' can't match a value of type  {s}", .{ v.name, self.types.name_of(sty) }, .Error, v.token);
             return;
