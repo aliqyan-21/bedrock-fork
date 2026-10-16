@@ -63,11 +63,13 @@ pub const TypeParam = struct {
 pub const Param = struct {
     name: []const u8 = "",
     is_const: bool,
+    is_comptime: bool,
     type: *Type,
     token: Token,
 
     pub fn print(self: *Param, indent: usize) anyerror!void {
         for (0..indent) |_| std.debug.print(" ", .{});
+        if (self.is_comptime) std.debug.print("comptime ", .{});
         std.debug.print("param: {s} -> ", .{self.name});
         try self.type.*.print(0);
     }

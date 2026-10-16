@@ -626,9 +626,16 @@ pub const Parser = struct {
         var param = ast.Param{
             .name = "",
             .is_const = false,
+            .is_comptime = false,
             .type = undefined,
             .token = undefined,
         };
+
+        // check for comptime
+        if (tok.type == .kw_comptime) {
+            param.is_comptime = true;
+            _ = try self.lexer.next();
+        }
 
         // name
         tok = try self.expect(.ident, "expected identifier") orelse token.Token{ .type = .ident, .val = "<error>", .line = tok.line, .col = tok.col };
@@ -726,7 +733,7 @@ pub const Parser = struct {
         var_stmt.value = try self.parse_expression();
 
         switch (var_stmt.value.*) {
-            .struct_literal => {},
+            .struct_literal, .comptime_expr => {},
             .unary => |*u| {
                 switch (u.operand.*) {
                     .struct_literal => {},
@@ -765,7 +772,7 @@ pub const Parser = struct {
         const_stmt.value = try self.parse_expression();
 
         switch (const_stmt.value.*) {
-            .struct_literal => {},
+            .struct_literal, .comptime_expr => {},
             // extect ';'
             else => try self.expect_decl_end(),
         }
@@ -1295,7 +1302,7 @@ pub const Parser = struct {
             },
             .kw_func => return try self.parse_func_type(tok),
             .kw_proc => return try self.parse_proc_type(tok),
-            .ident, .kw_ptr => {
+            .ident, .kw_ptr, .kw_type => {
                 if (std.meta.stringToEnum(ast.PrimitiveType, tok.val)) |prim| {
                     return ast.BaseType{ .primitive = prim };
                 }
@@ -1498,9 +1505,9 @@ pub const Parser = struct {
         _ = try self.expect(.eq, "expected '='");
         const_def.value = try self.parse_expression();
 
-        // extect ';' if not struct literal
+        // extect ';' if not struct literal or comptime expr
         switch (const_def.value.*) {
-            .struct_literal => {},
+            .struct_literal, .comptime_expr => {},
             else => try self.expect_decl_end(),
         }
 
@@ -1533,9 +1540,9 @@ pub const Parser = struct {
         _ = try self.expect(.eq, "expected '='");
         var_def.value = try self.parse_expression();
 
-        // extect ';' if not struct literal
+        // extect ';' if not struct literal or comptime expr
         switch (var_def.value.*) {
-            .struct_literal => {},
+            .struct_literal, .comptime_expr => {},
             else => try self.expect_decl_end(),
         }
 
@@ -1607,7 +1614,7 @@ pub const Parser = struct {
         return c_arg;
     }
 
-    pub fn parse_expression(self: *Parser) !*ast.Expr {
+    pub fn parse_expression(self: *Parser) anyerror!*ast.Expr {
         return try self.parse_expression_bp(0);
     }
 
@@ -1714,6 +1721,10 @@ pub const Parser = struct {
                 }
                 lhs = try self.allocator.create(ast.Expr);
                 lhs.* = .{ .array_literal = .{ .elements = elems, .token = tok } };
+            },
+            .kw_comptime => {
+                lhs = try self.allocator.create(ast.Expr);
+                lhs.* = .{ .comptime_expr = .{ .body = try self.parse_body(), .token = tok } };
             },
             else => {
                 try self.compiler.addError("expected an expression", err.Severity.Error, tok);
