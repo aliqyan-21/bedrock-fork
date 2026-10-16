@@ -54,8 +54,19 @@ pub const Parser = struct {
     }
 
     fn expect_decl_end(self: *Parser) !void {
-        if ((try self.lexer.peek_token()).type == .comma) return;
-        _ = try self.expect(.semicolon, "expected ';'");
+        const nxt = try self.lexer.peek_token();
+        if (nxt.type == .comma) return;
+        if (nxt.type == .semicolon) {
+            _ = try self.lexer.next();
+            return;
+        }
+        try self.compiler.addError("expected ',' or ';'", err.Severity.Error, nxt);
+        try self.sync(&.{
+            .semicolon, .kw_end,    .kw_elif,   .kw_else,  .kw_case,     .kw_var,    .kw_const,  .kw_static,
+            .kw_defer,  .kw_unsafe, .kw_return, .kw_break, .kw_continue, .kw_if,     .kw_match,  .kw_while,
+            .kw_for,    .kw_import, .kw_func,   .kw_proc,  .kw_type,     .kw_extern, .kw_inline, .kw_pub,
+        });
+        if ((try self.lexer.peek_token()).type == .semicolon) _ = try self.lexer.next();
     }
 
     // error type token
