@@ -1,0 +1,7 @@
+// output: 22
+
+func main() -> i32
+  var i0 = 11, x0: u8 = 7, y0: bool = true;
+  const i1 = 22, x1: u8 = 9, y1: bool = false;
+  return i1;
+end
