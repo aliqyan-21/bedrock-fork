@@ -665,7 +665,15 @@ pub const Codegen = struct {
             llvm.LLVMAddCase(sw, case_val, arm_bbs[i]);
         }
 
-        // else
+        for (m.arms.items, 0..) |*arm, i| {
+            llvm.LLVMPositionBuilderAtEnd(self.builder, arm_bbs[i]);
+            _ = try self.codegen_statements(arm.body);
+            if (llvm.LLVMGetBasicBlockTerminator(llvm.LLVMGetInsertBlock(self.builder)) == null) {
+                _ = llvm.LLVMBuildBr(self.builder, merge_bb);
+            }
+        }
+
+        // else arm
         llvm.LLVMPositionBuilderAtEnd(self.builder, default_bb);
         if (m.else_body) |body| {
             _ = try self.codegen_statements(body);
@@ -680,15 +688,41 @@ pub const Codegen = struct {
 
     fn codegen_match_pattern(self: *Codegen, p: *ast.Pattern, subject_ty: llvm.LLVMTypeRef) !llvm.LLVMValueRef {
         return switch (p.*) {
-            .integer => |s| blk: {
+            .integer => |s| {
                 const v = try std.fmt.parseInt(i64, s, 0);
-                break :blk llvm.LLVMConstInt(subject_ty, @bitCast(v), 1);
+                return llvm.LLVMConstInt(subject_ty, @bitCast(v), 1);
             },
-            .boolean => |b| llvm.LLVMConstInt(subject_ty, @intFromBool(b), 0),
-            .field_variant => |e| blk: {
-                const v = try self.codegen_expression(e);
-                if (llvm.LLVMIsConstant(v) == 0) return error.NonConstantPattern;
-                break :blk v;
+            .boolean => |b| return llvm.LLVMConstInt(subject_ty, @intFromBool(b), 0),
+            .field_variant => |e| {
+                // NOTE: doing `codegen_expression` on `field_variant` is resulted into an error, see the previous commit for stack trace log
+                const fa = switch (e.*) {
+                    .field_access => |*f| f,
+                    else => return error.UnsupportedPattern,
+                };
+
+                const enum_name = switch (fa.target.*) {
+                    .ident => |id| id.name,
+                    else => return error.UnsupportedPattern,
+                };
+
+                const variant_name = switch (fa.field.*) {
+                    .ident => |id| id.name,
+                    else => return error.UnsupportedPattern,
+                };
+
+                const enum_id = self.compiler.sema.types.resolve(enum_name) orelse return error.UnknownEnum;
+                const enum_info = switch (self.compiler.sema.types.get(enum_id).*) {
+                    .enum_ty => |*en| en,
+                    else => return error.UnknownEnum,
+                };
+
+                for (enum_info.variants.items, 0..) |*ev, idx| {
+                    if (std.mem.eql(u8, ev.name, variant_name)) {
+                        return llvm.LLVMConstInt(subject_ty, idx, 0);
+                    }
+                }
+
+                return error.UnknownEnumVariant;
             },
             else => error.UnsupportedPattern,
         };
