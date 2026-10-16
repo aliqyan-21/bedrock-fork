@@ -1067,6 +1067,21 @@ pub const Parser = struct {
         };
 
         const next = try self.lexer.peek_token();
+        // for c type enums
+        if (next.type == .dot) {
+            _ = try self.lexer.next();
+            const bp = postfix_binding_power(.dot).?;
+            const f = try self.parse_expression_bp(bp[1]);
+            const lhs = try self.allocator.create(ast.Expr);
+            lhs.* = .{ .ident = .{ .name = tok.val, .token = tok } };
+            const field_variant = try self.allocator.create(ast.Expr);
+            field_variant.* = .{
+                .field_access = .{ .target = lhs, .field = f, .token = tok },
+            };
+
+            return .{ .field_variant = field_variant };
+        }
+
         if (next.type != .l_paren) {
             return .{ .variant = pattern };
         }

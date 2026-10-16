@@ -643,11 +643,89 @@ pub const Codegen = struct {
             .if_expr => |*i| return try self.codegen_if(i),
             .while_expr => |*w| return try self.codegen_while(w),
             .for_expr => |*f| return try self.codegen_for(f),
-            else => {
-                // TODO:
-                unreachable;
-            },
+            .match_expr => |*m| return try self.codegen_match(m),
         }
+    }
+
+    pub fn codegen_match(self: *Codegen, m: *ast.MatchExpr) !llvm.LLVMValueRef {
+        const func = llvm.LLVMGetBasicBlockParent(self.entry);
+        const sub = try self.codegen_expression(m.subject);
+        const sub_ty = llvm.LLVMTypeOf(sub);
+
+        const default_bb = llvm.LLVMAppendBasicBlockInContext(self.ctx, func, "");
+        const merge_bb = llvm.LLVMAppendBasicBlockInContext(self.ctx, func, "");
+
+        const arm_bbs = try self.allocator.alloc(llvm.LLVMBasicBlockRef, m.arms.items.len);
+        defer self.allocator.free(arm_bbs);
+
+        const sw = llvm.LLVMBuildSwitch(self.builder, sub, default_bb, @intCast(m.arms.items.len));
+        for (m.arms.items, 0..) |*arm, i| {
+            arm_bbs[i] = llvm.LLVMAppendBasicBlockInContext(self.ctx, func, "match_arm");
+            const case_val = try self.codegen_match_pattern(&arm.pattern, sub_ty);
+            llvm.LLVMAddCase(sw, case_val, arm_bbs[i]);
+        }
+
+        for (m.arms.items, 0..) |*arm, i| {
+            llvm.LLVMPositionBuilderAtEnd(self.builder, arm_bbs[i]);
+            _ = try self.codegen_statements(arm.body);
+            if (llvm.LLVMGetBasicBlockTerminator(llvm.LLVMGetInsertBlock(self.builder)) == null) {
+                _ = llvm.LLVMBuildBr(self.builder, merge_bb);
+            }
+        }
+
+        // else arm
+        llvm.LLVMPositionBuilderAtEnd(self.builder, default_bb);
+        if (m.else_body) |body| {
+            _ = try self.codegen_statements(body);
+        }
+        if (llvm.LLVMGetBasicBlockTerminator(llvm.LLVMGetInsertBlock(self.builder)) == null) {
+            _ = llvm.LLVMBuildBr(self.builder, merge_bb);
+        }
+
+        llvm.LLVMPositionBuilderAtEnd(self.builder, merge_bb);
+        return null;
+    }
+
+    fn codegen_match_pattern(self: *Codegen, p: *ast.Pattern, subject_ty: llvm.LLVMTypeRef) !llvm.LLVMValueRef {
+        return switch (p.*) {
+            .integer => |s| {
+                const v = try std.fmt.parseInt(i64, s, 0);
+                return llvm.LLVMConstInt(subject_ty, @bitCast(v), 1);
+            },
+            .boolean => |b| return llvm.LLVMConstInt(subject_ty, @intFromBool(b), 0),
+            .field_variant => |e| {
+                // NOTE: doing `codegen_expression` on `field_variant` is resulted into an error, see the previous commit for stack trace log
+                const fa = switch (e.*) {
+                    .field_access => |*f| f,
+                    else => return error.UnsupportedPattern,
+                };
+
+                const enum_name = switch (fa.target.*) {
+                    .ident => |id| id.name,
+                    else => return error.UnsupportedPattern,
+                };
+
+                const variant_name = switch (fa.field.*) {
+                    .ident => |id| id.name,
+                    else => return error.UnsupportedPattern,
+                };
+
+                const enum_id = self.compiler.sema.types.resolve(enum_name) orelse return error.UnknownEnum;
+                const enum_info = switch (self.compiler.sema.types.get(enum_id).*) {
+                    .enum_ty => |*en| en,
+                    else => return error.UnknownEnum,
+                };
+
+                for (enum_info.variants.items, 0..) |*ev, idx| {
+                    if (std.mem.eql(u8, ev.name, variant_name)) {
+                        return llvm.LLVMConstInt(subject_ty, idx, 0);
+                    }
+                }
+
+                return error.UnknownEnumVariant;
+            },
+            else => error.UnsupportedPattern,
+        };
     }
 
     pub fn codegen_while(self: *Codegen, w: *ast.WhileExpr) !llvm.LLVMValueRef {

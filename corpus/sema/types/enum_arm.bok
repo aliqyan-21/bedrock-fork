@@ -1,0 +1,24 @@
+type Color = enum
+  pink,
+  green,
+  red,
+end
+
+type Coffee = enum
+  light,
+  dark,
+end
+
+proc main()
+  const c: Color = Color.pink;
+  match c
+    case Color.pink  // ok
+      _ = 1;
+    case Coffee.dark  // this will error mismatch of enum
+      _ = 2;
+    case Nope.pink   // this will error as unkown Nope
+      _ = 3;
+    case Color.blue  // error as there's no blue in enum Color
+      _ = 4;
+  end
+end

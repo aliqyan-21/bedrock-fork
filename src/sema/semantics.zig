@@ -547,6 +547,87 @@ pub const Sema = struct {
         }
     }
 
+    fn visit_pattern(self: *Sema, pat: *ast.Pattern, sty: types.TypeId, tok: Token) !void {
+        if (sty == .invalid) return;
+        switch (pat.*) {
+            .integer => if (!self.types.literal_fits(.integer, sty)) {
+                try self.compiler.add_sem_error("integer pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, tok);
+            },
+            .boolean => if (!self.types.assignable(try self.types.primitive(.bool), sty)) {
+                try self.compiler.add_sem_error("bool pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, tok);
+            },
+            .variant => |*v| try self.visit_variant_pattern(v, sty),
+            .field_variant => |expr| try self.visit_field_variant_pattern(expr, sty),
+            else => {
+                // try pat.print(0);
+            }, // TODO
+        }
+    }
+
+    fn visit_variant_pattern(self: *Sema, v: *ast.VariantPattern, sty: types.TypeId) !void {
+        if (self.types.get(sty).* != .enum_ty) {
+            try self.compiler.add_sem_error("variant pattern '{s}' can't match a value of type  {s}", .{ v.name, self.types.name_of(sty) }, .Error, v.token);
+            return;
+        }
+        const edef = self.types.get(sty).enum_ty;
+        var vname = v.name;
+        if (std.mem.lastIndexOfScalar(u8, v.name, '.')) |dot| {
+            vname = v.name[dot + 1 ..];
+            const ename = v.name[0..dot];
+            const sym = self.scope.resolve(ename) orelse {
+                try self.compiler.add_sem_error("Unknown identifier: '{s}'", .{ename}, .Error, v.token);
+                return;
+            };
+            if ((sym.kind != .@"enum" and sym.kind != .type_alias) or sym.ty != sty) {
+                try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(sty), ename }, .Error, v.token);
+                return;
+            }
+        }
+
+        for (edef.variants.items) |ev| {
+            if (!std.mem.eql(u8, ev.name, vname)) continue;
+            return;
+        }
+        try self.compiler.add_sem_error("enum '{s}' has no variant '{s}'", .{ edef.name, vname }, .Error, v.token);
+    }
+
+    fn visit_field_variant_pattern(self: *Sema, expr: *ast.Expr, sty: types.TypeId) !void {
+        if (expr.* != .field_access) return;
+        const fa = expr.field_access;
+
+        const ename = switch (fa.target.*) {
+            .ident => |i| i.name,
+            else => {
+                try self.compiler.add_sem_error("expected enum name before '.'", .{}, .Error, fa.token);
+                return;
+            },
+        };
+
+        const vname = switch (fa.field.*) {
+            .ident => |i| i.name,
+            else => {
+                try self.compiler.add_sem_error("expected variant name after '.'", .{}, .Error, fa.token);
+                return;
+            },
+        };
+
+        var tmp = ast.VariantPattern{
+            .name = try std.fmt.allocPrint(self.types.arena.allocator(), "{s}.{s}", .{ ename, vname }),
+            .params = .empty,
+            .token = fa.token,
+        };
+
+        try self.visit_variant_pattern(&tmp, sty);
+    }
+
+    fn get_variant_name(pat: *ast.Pattern) ?[]const u8 {
+        return switch (pat.*) {
+            .variant => |v| if (std.mem.lastIndexOfScalar(u8, v.name, '.')) |dot| v.name[dot + 1 ..] else v.name,
+            .field_variant => |expr| if (expr.* == .field_access and expr.field_access.field.* == .ident) expr.field_access.field.ident.name else null,
+            else => null,
+        };
+    }
+
     fn visit_control_flow(self: *Sema, stmt: *ast.ControlFlowStmt) !void {
         // std.debug.print("visiting control flow\n", .{});
         switch (stmt.*) {
@@ -562,10 +643,30 @@ pub const Sema = struct {
                 }
             },
             .match_expr => |*m| {
-                _ = try self.visit_expression(m.subject, null);
+                const sty = try self.visit_expression(m.subject, null);
+
+                // using hashmap to track that if all the enum variants are used.
+                // could there be a better way to do this?
+                var covered = std.StringHashMap(void).init(self.compiler.allocator);
+                defer covered.deinit();
 
                 for (m.arms.items) |*arm| {
+                    try self.visit_pattern(&arm.pattern, sty, arm.token);
+                    if (sty != .invalid and self.types.get(sty).* == .enum_ty) {
+                        if (get_variant_name(&arm.pattern)) |vname| {
+                            try covered.put(vname, {});
+                        }
+                    }
                     try self.enter_scope(arm.body.items, .block);
+                }
+
+                if (sty != .invalid and self.types.get(sty).* == .enum_ty and m.else_body == null) {
+                    const edef = self.types.get(sty).enum_ty;
+                    for (edef.variants.items) |ev| {
+                        if (!covered.contains(ev.name)) {
+                            try self.compiler.add_sem_error("enumeration value '{s}' not handled in match", .{ev.name}, .Error, m.token);
+                        }
+                    }
                 }
 
                 if (m.else_body) |*body| {
