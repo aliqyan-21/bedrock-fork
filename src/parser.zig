@@ -53,6 +53,22 @@ pub const Parser = struct {
         }
     }
 
+    fn expect_decl_end(self: *Parser) !void {
+        const nxt = try self.lexer.peek_token();
+        if (nxt.type == .comma) return;
+        if (nxt.type == .semicolon) {
+            _ = try self.lexer.next();
+            return;
+        }
+        try self.compiler.addError("expected ',' or ';'", err.Severity.Error, nxt);
+        try self.sync(&.{
+            .semicolon, .kw_end,    .kw_elif,   .kw_else,  .kw_case,     .kw_var,    .kw_const,  .kw_static,
+            .kw_defer,  .kw_unsafe, .kw_return, .kw_break, .kw_continue, .kw_if,     .kw_match,  .kw_while,
+            .kw_for,    .kw_import, .kw_func,   .kw_proc,  .kw_type,     .kw_extern, .kw_inline, .kw_pub,
+        });
+        if ((try self.lexer.peek_token()).type == .semicolon) _ = try self.lexer.next();
+    }
+
     // error type token
     fn error_type(self: *Parser, tok: token.Token) !*ast.Type {
         const ty = try self.allocator.create(ast.Type);
@@ -121,17 +137,19 @@ pub const Parser = struct {
                     const extern_def = try self.parse_extern_def();
                     try items.append(self.allocator, ast.Item{ .extern_def = extern_def });
                 },
-                .kw_var => {
+                .kw_var => while (true) {
                     var var_def = try self.parse_var_def();
                     var_def.is_pub = is_pub;
                     var_def.is_global = true;
                     try items.append(self.allocator, ast.Item{ .var_def = var_def });
+                    if ((try self.lexer.peek_token()).type != .comma) break;
                 },
-                .kw_const => {
+                .kw_const => while (true) {
                     var const_def = try self.parse_const_def();
                     const_def.is_pub = is_pub;
                     const_def.is_global = true;
                     try items.append(self.allocator, ast.Item{ .const_def = const_def });
+                    if ((try self.lexer.peek_token()).type != .comma) break;
                 },
                 else => {
                     // TODO:: error handling
@@ -635,7 +653,17 @@ pub const Parser = struct {
         while (true) {
             const tok = try self.lexer.peek_token();
             if (tok.type == .kw_end or tok.type == .kw_elif or tok.type == .kw_else or tok.type == .eof or tok.type == .kw_case) break;
-            try stmts.append(self.allocator, try self.parse_statement());
+            var stmt = try self.parse_statement();
+            try stmts.append(self.allocator, stmt);
+            while ((try self.lexer.peek_token()).type == .comma) {
+                stmt = switch (stmt) {
+                    .var_stmt => try self.parse_var_stmt(),
+                    .const_stmt => try self.parse_const_stmt(),
+                    .local_static_var_stmt => try self.parse_local_static_var_stmt(),
+                    else => break,
+                };
+                try stmts.append(self.allocator, stmt);
+            }
         }
         const tok = try self.lexer.peek_token();
         switch (tok.type) {
@@ -702,11 +730,11 @@ pub const Parser = struct {
             .unary => |*u| {
                 switch (u.operand.*) {
                     .struct_literal => {},
-                    else => _ = try self.expect(.semicolon, "expected ';'"),
+                    else => try self.expect_decl_end(),
                 }
             },
             // extect ';'
-            else => _ = try self.expect(.semicolon, "expected ';'"),
+            else => try self.expect_decl_end(),
         }
 
         return ast.Stmt{ .var_stmt = var_stmt };
@@ -739,7 +767,7 @@ pub const Parser = struct {
         switch (const_stmt.value.*) {
             .struct_literal => {},
             // extect ';'
-            else => _ = try self.expect(.semicolon, "expected ';'"),
+            else => try self.expect_decl_end(),
         }
 
         return ast.Stmt{ .const_stmt = const_stmt };
@@ -772,7 +800,7 @@ pub const Parser = struct {
             .token = tok,
         };
 
-        _ = try self.expect(.kw_var, "expected 'var'");
+        if (tok.type == .kw_static) _ = try self.expect(.kw_var, "expected 'var'");
 
         tok = try self.expect(.ident, "expected name ident") orelse token.Token{ .type = .ident, .val = "<error>", .line = tok.line, .col = tok.col };
         lsv_stmt.name = tok.val;
@@ -786,7 +814,7 @@ pub const Parser = struct {
         _ = try self.expect(.eq, "expected '='");
         lsv_stmt.value = try self.parse_expression();
 
-        _ = try self.expect(.semicolon, "expected ';'");
+        try self.expect_decl_end();
 
         return ast.Stmt{ .local_static_var_stmt = lsv_stmt };
     }
@@ -1473,9 +1501,7 @@ pub const Parser = struct {
         // extect ';' if not struct literal
         switch (const_def.value.*) {
             .struct_literal => {},
-            else => {
-                _ = try self.expect(.semicolon, "expected ';'");
-            },
+            else => try self.expect_decl_end(),
         }
 
         return const_def;
@@ -1510,9 +1536,7 @@ pub const Parser = struct {
         // extect ';' if not struct literal
         switch (var_def.value.*) {
             .struct_literal => {},
-            else => {
-                _ = try self.expect(.semicolon, "expected ';'");
-            },
+            else => try self.expect_decl_end(),
         }
 
         return var_def;
