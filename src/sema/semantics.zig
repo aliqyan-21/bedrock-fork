@@ -13,11 +13,14 @@ const Token = @import("../token.zig").Token;
 
 const TypeId = types.TypeId;
 
+const Phase = enum { type_names, declare, bodies };
+
 pub const Sema = struct {
     compiler: *compiler.Compiler,
     scope: *scope.Scope,
     types: types.TypeSystem,
     expr_types: std.AutoHashMapUnmanaged(*ast.Expr, types.TypeId) = .{},
+    item_types: std.AutoHashMapUnmanaged(*const anyopaque, TypeId) = .{},
     discard: bool = false, // this is for dicarded values check, like in proc
 
     pub fn init(c: *compiler.Compiler) Sema {
@@ -32,6 +35,7 @@ pub const Sema = struct {
     pub fn deinit(self: *Sema) void {
         self.types.deinit();
         self.expr_types.deinit(self.compiler.allocator);
+        self.item_types.deinit(self.compiler.allocator);
     }
 
     pub fn analyze(self: *Sema) !void {
@@ -40,8 +44,9 @@ pub const Sema = struct {
         self.scope = &root;
         const tree = &self.compiler.ast;
 
-        for (tree.program.items.items) |*item| {
-            try self.visit_item(item);
+        const items = tree.program.items.items;
+        for ([_]Phase{ .type_names, .declare, .bodies }) |phase| {
+            for (items) |*item| try self.visit_item(item, phase);
         }
     }
 
@@ -183,12 +188,14 @@ pub const Sema = struct {
     fn declare_func(self: *Sema, f: *ast.FunctionDef, name: []const u8) !TypeId {
         const fnty = try self.func_type(f.params.items, f.result, name, "function", f.result.token, false);
         try self.declare(.{ .name = name, .kind = .func, .ty = fnty }, f.token);
+        try self.item_types.put(self.compiler.allocator, f, fnty);
         return fnty;
     }
 
     fn declare_proc(self: *Sema, p: *ast.ProcDef, name: []const u8) !TypeId {
         const prty = try self.proc_type(p.params.items, false);
         try self.declare(.{ .name = name, .kind = .func, .ty = prty }, p.token);
+        try self.item_types.put(self.compiler.allocator, p, prty);
         return prty;
     }
 
@@ -207,8 +214,18 @@ pub const Sema = struct {
 
     // --- type definitions ---
 
-    fn declare_struct(self: *Sema, s: *ast.StructDef) !void {
+    fn declare_struct_name(self: *Sema, s: *ast.StructDef) !void {
+        const sty = try self.types.intern(.{ .struct_ty = .{ .name = s.name, .fields = .empty } });
+        try self.item_types.put(self.compiler.allocator, s, sty);
+        try self.types.register(s.name, sty);
+        try self.declare(.{ .name = s.name, .kind = .@"struct", .ty = sty }, s.token);
+    }
+
+    fn define_struct(self: *Sema, s: *ast.StructDef) !void {
         const alloc = self.compiler.allocator;
+        const sty = self.item_types.get(s).?;
+        if (self.types.get(sty).struct_ty.fields.items.len != 0) return; // duplicate name: first wins
+
         var field_tys: std.ArrayList(types.StFieldTy) = .empty;
         errdefer field_tys.deinit(alloc);
         for (s.fields.items) |*s_f| {
@@ -218,10 +235,7 @@ pub const Sema = struct {
             }
             try field_tys.append(alloc, .{ .name = s_f.name, .ty = fty });
         }
-
-        const sty = try self.types.intern(.{ .struct_ty = .{ .name = s.name, .fields = field_tys } });
-        try self.types.register(s.name, sty);
-        try self.declare(.{ .name = s.name, .kind = .@"struct", .ty = sty }, s.token);
+        self.types.get(sty).struct_ty.fields = field_tys;
     }
 
     fn check_duplicate_fields(self: *Sema, s: *ast.StructDef) !void {
@@ -248,36 +262,39 @@ pub const Sema = struct {
     // of all methods in struct (so methods can call
     // each other in any order) then again we do pass
     // and this time we visit the bodies of methods.
-    fn visit_methods(self: *Sema, s: *ast.StructDef) !void {
-        const alloc = self.compiler.allocator;
-        var sigs: std.ArrayList(TypeId) = .empty;
-        defer sigs.deinit(alloc);
-
+    fn declare_methods(self: *Sema, s: *ast.StructDef) !void {
         for (s.methods.items) |*m| switch (m.*) {
             .func => |*f| {
                 try self.check_method_clash(s, f.name, f.token);
-                try sigs.append(alloc, try self.declare_func(f, try self.qualify(s.name, f.name)));
+                _ = try self.declare_func(f, try self.qualify(s.name, f.name));
             },
             .proc => |*p| {
                 try self.check_method_clash(s, p.name, p.token);
-                try sigs.append(alloc, try self.declare_proc(p, try self.qualify(s.name, p.name)));
+                _ = try self.declare_proc(p, try self.qualify(s.name, p.name));
             },
-        };
-        for (s.methods.items, sigs.items) |*m, sig| switch (m.*) {
-            .func => |*f| try self.check_function(f, sig),
-            .proc => |*p| try self.check_proc(p, sig),
         };
     }
 
-    fn visit_struct(self: *Sema, s: *ast.StructDef) !void {
-        try self.declare_struct(s);
-        try self.check_duplicate_fields(s);
-        try self.visit_methods(s);
+    fn check_methods(self: *Sema, s: *ast.StructDef) !void {
+        for (s.methods.items) |*m| switch (m.*) {
+            .func => |*f| try self.check_function(f),
+            .proc => |*p| try self.check_proc(p),
+        };
+    }
+
+    fn declare_enum_name(self: *Sema, en: anytype) !void {
+        const ety = try self.types.intern(.{ .enum_ty = .{ .name = en.name, .variants = .empty } });
+        try self.item_types.put(self.compiler.allocator, en, ety);
+        try self.types.register(en.name, ety);
+        try self.declare(.{ .name = en.name, .kind = .@"enum", .ty = ety }, en.token);
     }
 
     // `en` / `a`: payloads of the enum_def / alias type_def variants
-    fn declare_enum(self: *Sema, en: anytype) !void {
-        const alloc = self.compiler.allocator;
+    fn define_enum(self: *Sema, en: anytype) !void {
+        const ety = self.item_types.get(en).?;
+        if (self.types.get(ety).enum_ty.variants.items.len != 0) return; // duplicate name: first wins
+
+        // collect variants (this is the old loop from declare_enum, unchanged)
         var variants: std.ArrayList(types.EnumVaraintTy) = .empty;
         for (en.variants.items) |*v| {
             for (variants.items) |vt| {
@@ -287,20 +304,16 @@ pub const Sema = struct {
             }
             var tys: std.ArrayList(TypeId) = .empty;
             for (v.types.items) |t| {
-                try tys.append(alloc, try self.resolve_type(t));
+                try tys.append(self.compiler.allocator, try self.resolve_type(t));
             }
-            try variants.append(alloc, .{ .name = v.name, .types = tys });
+            try variants.append(self.compiler.allocator, .{ .name = v.name, .types = tys });
         }
+        self.types.get(ety).enum_ty.variants = variants;
 
-        const ety = try self.types.intern(.{ .enum_ty = .{ .name = en.name, .variants = variants } });
-        try self.types.register(en.name, ety);
-        try self.declare(.{ .name = en.name, .kind = .@"enum", .ty = ety }, en.token);
-
-        // each variant is also a constructor function: Enum.Variant(payload...) -> Enum
         const edef = self.types.get(ety).enum_ty;
         for (edef.variants.items) |v| {
             const ctorty = try self.types.intern(.{ .function = .{
-                .params = try v.types.clone(alloc),
+                .params = try v.types.clone(self.compiler.allocator),
                 .result = ety,
             } });
             // duplicate variants were already reported above
@@ -344,7 +357,8 @@ pub const Sema = struct {
         try self.enter_scope(body, .block);
     }
 
-    fn check_function(self: *Sema, f: *ast.FunctionDef, fnty: TypeId) !void {
+    fn check_function(self: *Sema, f: *ast.FunctionDef) !void {
+        const fnty = self.item_types.get(f).?;
         const sig = self.types.get(fnty).function;
         try self.check_fn_body(f.params.items, sig.params.items, f.body.items, .{ .func = sig.result });
 
@@ -353,7 +367,8 @@ pub const Sema = struct {
         }
     }
 
-    fn check_proc(self: *Sema, p: *ast.ProcDef, prty: TypeId) !void {
+    fn check_proc(self: *Sema, p: *ast.ProcDef) !void {
+        const prty = self.item_types.get(p).?;
         const sig = self.types.get(prty).procedure;
         try self.check_fn_body(p.params.items, sig.params.items, p.body.items, .proc);
     }
@@ -362,25 +377,39 @@ pub const Sema = struct {
 
     // Items are declared and checked one after another, so an
     // item can only use items above it for now.
-    fn visit_item(self: *Sema, item: *ast.Item) !void {
+    fn visit_item(self: *Sema, item: *ast.Item, phase: Phase) !void {
         switch (item.*) {
             .import_def => {},
-            .function => |*f| {
-                const fnty = try self.declare_func(f, f.name);
-                try self.check_function(f, fnty);
+            .function => |*f| switch (phase) {
+                .declare => _ = try self.declare_func(f, f.name),
+                .bodies => try self.check_function(f),
+                .type_names => {},
             },
-            .proc => |*p| {
-                const prty = try self.declare_proc(p, p.name);
-                try self.check_proc(p, prty);
+            .proc => |*p| switch (phase) {
+                .declare => _ = try self.declare_proc(p, p.name),
+                .bodies => try self.check_proc(p),
+                .type_names => {},
             },
             .type_def => |*t_def| switch (t_def.variant) {
-                .struct_def => |*s| try self.visit_struct(s),
-                .enum_def => |*en| try self.declare_enum(en),
-                .alias => |*a| try self.declare_alias(a),
+                .struct_def => |*s| switch (phase) {
+                    .type_names => try self.declare_struct_name(s),
+                    .declare => {
+                        try self.define_struct(s);
+                        try self.check_duplicate_fields(s);
+                        try self.declare_methods(s);
+                    },
+                    .bodies => try self.check_methods(s),
+                },
+                .enum_def => |*en| switch (phase) {
+                    .type_names => try self.declare_enum_name(en),
+                    .declare => try self.define_enum(en),
+                    .bodies => {},
+                },
+                .alias => |*a| if (phase == .declare) try self.declare_alias(a),
             },
-            .extern_def => |e_def| try self.declare_extern(e_def),
-            .var_def => |*v| try self.check_binding(.variable, v.name, v.type_ann, v.value, v.token),
-            .const_def => |*c| try self.check_binding(.constant, c.name, c.type_ann, c.value, c.token),
+            .extern_def => |e_def| if (phase == .declare) try self.declare_extern(e_def),
+            .var_def => |*v| if (phase == .declare) try self.check_binding(.variable, v.name, v.type_ann, v.value, v.token),
+            .const_def => |*c| if (phase == .declare) try self.check_binding(.constant, c.name, c.type_ann, c.value, c.token),
         }
     }
 };
