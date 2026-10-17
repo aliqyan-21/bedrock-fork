@@ -1,11 +1,15 @@
 const std = @import("std");
 const ast = @import("../ast.zig");
-const scope_mod = @import("scope.zig");
 
 pub const TypeId = enum(u32) {
     invalid = 0,
     _,
 };
+
+// `.invalid` means "nothing known"; as an expected-type hint that is `null`.
+pub fn hint(id: TypeId) ?TypeId {
+    return if (id != .invalid) id else null;
+}
 
 pub const Primitive = enum {
     // zig fmt: off
@@ -35,12 +39,17 @@ pub const Type = union(enum) {
     enum_ty: struct { name: []const u8, variants: std.ArrayList(EnumVaraintTy) },
 };
 
+// this struct owns every type. Types are interned (structurally equal types share one
+// `TypeId`), so type equality everywhere else is just `a == b`.
 pub const TypeSystem = struct {
     allocator: std.mem.Allocator,
     types: std.ArrayList(Type),
     arena: std.heap.ArenaAllocator,
     pids: [@typeInfo(Primitive).@"enum".field_names.len]TypeId, // primtive ids
     struct_reg: std.StringArrayHashMapUnmanaged(TypeId) = .empty, // struct registry for storing all defined struct (for codegen)
+
+    heads: std.AutoHashMapUnmanaged(u64, TypeId) = .{},
+    next_same_hash: std.ArrayList(TypeId) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) TypeSystem {
         return .{
@@ -52,21 +61,26 @@ pub const TypeSystem = struct {
     }
 
     pub fn deinit(self: *TypeSystem) void {
-        for (self.types.items) |*ty| {
-            switch (ty.*) {
-                .function => |*f| f.params.deinit(self.allocator),
-                .procedure => |*p| p.params.deinit(self.allocator),
-                .struct_ty => |*s| s.fields.deinit(self.allocator),
-                .enum_ty => |*e| {
-                    for (e.variants.items) |*v| v.types.deinit(self.allocator);
-                    e.variants.deinit(self.allocator);
-                },
-                else => {},
-            }
-        }
+        for (self.types.items) |*ty| release(self.allocator, ty);
         self.types.deinit(self.allocator);
+        self.next_same_hash.deinit(self.allocator);
+        self.heads.deinit(self.allocator);
         self.arena.deinit();
         self.struct_reg.deinit(self.allocator);
+    }
+
+    // frees the heap lists a Type owns
+    fn release(allocator: std.mem.Allocator, ty: *Type) void {
+        switch (ty.*) {
+            .function => |*f| f.params.deinit(allocator),
+            .procedure => |*p| p.params.deinit(allocator),
+            .struct_ty => |*s| s.fields.deinit(allocator),
+            .enum_ty => |*e| {
+                for (e.variants.items) |*v| v.types.deinit(allocator);
+                e.variants.deinit(allocator);
+            },
+            else => {},
+        }
     }
 
     pub fn get(self: *TypeSystem, id: TypeId) *Type {
@@ -74,9 +88,42 @@ pub const TypeSystem = struct {
         return &self.types.items[@backingInt(id) - 1];
     }
 
+    // append a type without looking for an equal one (prefer `intern`)
     pub fn add(self: *TypeSystem, ty: Type) !TypeId {
-        try self.types.append(self.allocator, ty);
-        return @fromBackingInt(@intCast(self.types.items.len));
+        return self.add_hashed(ty, hash_type(ty));
+    }
+
+    fn add_hashed(self: *TypeSystem, ty: Type, h: u64) !TypeId {
+        // reserve everything first so a failure can't leave the index half updated
+        try self.types.ensureUnusedCapacity(self.allocator, 1);
+        try self.next_same_hash.ensureUnusedCapacity(self.allocator, 1);
+        const slot = try self.heads.getOrPut(self.allocator, h);
+
+        self.types.appendAssumeCapacity(ty);
+        const id: TypeId = @fromBackingInt(@intCast(self.types.items.len));
+        self.next_same_hash.appendAssumeCapacity(if (slot.found_existing) slot.value_ptr.* else .invalid);
+        slot.value_ptr.* = id;
+        return id;
+    }
+
+    fn find(self: *TypeSystem, ty: Type, h: u64) ?TypeId {
+        var cur = self.heads.get(h) orelse return null;
+        while (cur != .invalid) : (cur = self.next_same_hash.items[@backingInt(cur) - 1]) {
+            if (is_type_eql(self.get(cur).*, ty)) return cur;
+        }
+        return null;
+    }
+
+    // returns the canonical id for `ty`, adding it if it is new.
+    // takes ownership of any lists inside `ty` (freed if an equal type exists).
+    pub fn intern(self: *TypeSystem, ty: Type) !TypeId {
+        const h = hash_type(ty);
+        if (self.find(ty, h)) |id| {
+            var discarded = ty;
+            release(self.allocator, &discarded);
+            return id;
+        }
+        return self.add_hashed(ty, h);
     }
 
     pub fn primitive(self: *TypeSystem, p: Primitive) !TypeId {
@@ -89,60 +136,44 @@ pub const TypeSystem = struct {
         return id;
     }
 
-    //todo: implment other types
+    fn hash_id(h: *std.hash.Wyhash, id: TypeId) void {
+        const v: u32 = @backingInt(id);
+        h.update(std.mem.asBytes(&v));
+    }
 
-    // this does same work as visit type but now returns the typeid too,
-    // as it will become complete then there will be no need for visit_type, then
-    // just resolve_type will be used everywhere then we can remove visit_type
-    pub fn resolve_type(self: *TypeSystem, ty: *ast.Type, scope: *scope_mod.Scope) !TypeId {
-        var id: TypeId = switch (ty.base) {
-            .primitive => |p| try self.from_ast_primitive(p),
-            .pointer => |inner| blk: {
-                const cid = try self.resolve_type(inner, scope);
-                break :blk try self.intern(.{ .pointer = .{ .child = cid } });
+    fn hash_type(ty: Type) u64 {
+        var h = std.hash.Wyhash.init(0);
+        const tag: u32 = @backingInt(std.meta.activeTag(ty));
+        h.update(std.mem.asBytes(&tag));
+        switch (ty) {
+            .primitive => |p| {
+                const v: u32 = @backingInt(p);
+                h.update(std.mem.asBytes(&v));
             },
-            .slice => |*s| blk: {
-                const cid = try self.resolve_type(s.elem, scope);
-                break :blk try self.intern(.{ .slice = .{ .child = cid } });
+            .pointer => |p| hash_id(&h, p.child),
+            .array => |a| {
+                hash_id(&h, a.child);
+                h.update(std.mem.asBytes(&a.len));
             },
-            .array => |*a| blk: {
-                const cid = try self.resolve_type(a.elem, scope);
-                // rewriting the ast here, evaluating the expr if we got expr as size
-                if (a.size == .expr) {
-                    const e = a.size.expr;
-                    const n = const_int(e, scope) orelse break :blk .invalid;
-                    e.deinit(self.allocator);
-                    a.size = .{ .fixed = try std.fmt.allocPrint(self.arena.allocator(), "{d}", .{n}) };
-                }
-                break :blk switch (a.size) {
-                    .fixed => |d| self.intern(.{ .array = .{ .child = cid, .len = std.fmt.parseInt(u64, d, 10) catch return .invalid } }) catch return .invalid,
-                    .expr => .invalid,
-                    .inferred => .invalid,
-                };
+            .slice => |s| hash_id(&h, s.child),
+            .optional => |c| hash_id(&h, c),
+            .error_union => |c| hash_id(&h, c),
+            .function => |f| {
+                h.update(std.mem.sliceAsBytes(f.params.items));
+                hash_id(&h, f.result);
+                const variadic: u8 = if (f.is_variadic) 1 else 0;
+                h.update(std.mem.asBytes(&variadic));
             },
-            .func => |*f| blk: {
-                var params: std.ArrayList(TypeId) = .empty;
-                for (f.params.items) |p| try params.append(self.allocator, try self.resolve_type(p, scope));
-                const rid = try self.resolve_type(f.result, scope);
-                break :blk try self.intern(.{ .function = .{ .params = params, .result = rid } });
+            .procedure => |p| {
+                h.update(std.mem.sliceAsBytes(p.params.items));
+                const variadic: u8 = if (p.is_variadic) 1 else 0;
+                h.update(std.mem.asBytes(&variadic));
             },
-            .proc => |*pr| blk: {
-                var params: std.ArrayList(TypeId) = .empty;
-                for (pr.params.items) |p| try params.append(self.allocator, try self.resolve_type(p, scope));
-                break :blk try self.intern(.{ .procedure = .{ .params = params } });
-            },
-            .named => |n| blk: {
-                const sym = scope.resolve(n.name) orelse break :blk .invalid;
-                break :blk switch (sym.kind) {
-                    .@"struct", .@"enum", .type_alias => sym.ty,
-                    else => .invalid,
-                };
-            },
-        };
-
-        if (ty.is_optional) id = try self.intern(.{ .optional = id });
-        if (ty.is_error_union) id = try self.intern(.{ .error_union = id });
-        return id;
+            .range => |r| hash_id(&h, r.elem),
+            .struct_ty => |s| h.update(s.name),
+            .enum_ty => |e| h.update(e.name),
+        }
+        return h.final();
     }
 
     fn is_type_eql(a: Type, b: Type) bool {
@@ -150,7 +181,7 @@ pub const TypeSystem = struct {
         return switch (a) {
             .primitive => a.primitive == b.primitive,
             .pointer => a.pointer.child == b.pointer.child,
-            .array => a.array.child == b.array.child,
+            .array => a.array.child == b.array.child and a.array.len == b.array.len,
             .slice => a.slice.child == b.slice.child,
             .optional => a.optional == b.optional,
             .error_union => a.error_union == b.error_union,
@@ -165,52 +196,13 @@ pub const TypeSystem = struct {
         };
     }
 
-    // function for helping in adding type to
-    // our types if it does not exisit already
-    // for use in resolve_type
-    pub fn intern(self: *TypeSystem, ty: Type) !TypeId {
-        for (self.types.items, 0..) |e, i| {
-            if (is_type_eql(e, ty)) {
-                var discarded = ty;
-                switch (discarded) {
-                    .function => |*f| f.params.deinit(self.allocator),
-                    .procedure => |*p| p.params.deinit(self.allocator),
-                    .struct_ty => |*s| s.fields.deinit(self.allocator),
-                    else => {},
-                }
-                return @fromBackingInt(@intCast(i + 1));
-            }
-        }
-        return self.add(ty);
-    }
-
     // for mapping ast primitive to sema primitive
     pub fn from_ast_primitive(self: *TypeSystem, p: ast.PrimitiveType) !TypeId {
         const mapped = std.meta.stringToEnum(Primitive, @tagName(p)) orelse unreachable;
         return self.primitive(mapped);
     }
 
-    pub fn body_returns(self: TypeSystem, stms: []ast.Stmt) bool {
-        if (stms.len == 0) return false;
-        return switch (stms[stms.len - 1]) {
-            .return_stmt, .break_stmt, .continue_stmt => true,
-            .control_flow_stmt => |cf| switch (cf) {
-                .if_expr => |i| blk: {
-                    const eb = i.else_body orelse break :blk false;
-                    if (!self.body_returns(i.then_body.items)) break :blk false;
-                    for (i.elifs.items) |e| if (!self.body_returns(e.body.items)) break :blk false;
-                    break :blk self.body_returns(eb.items);
-                },
-                .match_expr => |m| blk: {
-                    const eb = m.else_body orelse break :blk false;
-                    for (m.arms.items) |arm| if (!self.body_returns(arm.body.items)) break :blk false;
-                    break :blk self.body_returns(eb.items);
-                },
-                else => false,
-            },
-            else => false,
-        };
-    }
+    // -------- numeric classification ------ //
 
     const NumKind = enum { signed, unsigned, float };
     const NumRank = struct { kind: NumKind, bits: u8 };
@@ -232,6 +224,31 @@ pub const TypeSystem = struct {
             .bool, .char, .str, .ptr => null,
         };
     }
+
+    fn rank_of(self: *TypeSystem, id: TypeId) ?NumRank {
+        if (id == .invalid) return null;
+        return switch (self.get(id).*) {
+            .primitive => |p| numeric_rank(p),
+            else => null,
+        };
+    }
+
+    // integers and floats
+    pub fn is_numeric(self: *TypeSystem, id: TypeId) bool {
+        return self.rank_of(id) != null;
+    }
+
+    pub fn is_integer(self: *TypeSystem, id: TypeId) bool {
+        const r = self.rank_of(id) orelse return false;
+        return r.kind != .float;
+    }
+
+    pub fn is_unsigned(self: *TypeSystem, id: TypeId) bool {
+        const r = self.rank_of(id) orelse return false;
+        return r.kind == .unsigned;
+    }
+
+    // ------ conversions ----- //
 
     // when conversion situation arise we will use to find out
     // if we can implicitly convert between two types (from -> to)
@@ -316,6 +333,18 @@ pub const TypeSystem = struct {
         };
     }
 
+    // it gets the struct type of a pointer struct
+    // and a normal struct so (self: *P) and (self: P)
+    // could be called in same way (p.foo()) and not (&p.foo())
+    pub fn struct_of(self: *TypeSystem, tty: TypeId) TypeId {
+        if (tty == .invalid) return .invalid;
+        return switch (self.get(tty).*) {
+            .struct_ty, .enum_ty => tty,
+            .pointer => |p| if (p.child != .invalid and self.get(p.child).* == .struct_ty) p.child else .invalid,
+            else => .invalid,
+        };
+    }
+
     // struct or named type specific things //
     pub fn register(self: *TypeSystem, name: []const u8, id: TypeId) !void {
         try self.struct_reg.put(self.allocator, name, id);
@@ -323,31 +352,5 @@ pub const TypeSystem = struct {
 
     pub fn resolve(self: *TypeSystem, name: []const u8) ?TypeId {
         return self.struct_reg.get(name);
-    }
-
-    // for constant expr evaluation at semantics stage
-    pub fn const_int(e: *ast.Expr, scope: *scope_mod.Scope) ?usize { // as it's for array size I am returning usize
-        switch (e.*) {
-            .literal => |l| return if (l.kind == .integer) l.ivalue else null,
-            .ident => |i| {
-                const sym = scope.resolve(i.name) orelse return null;
-                return if (sym.kind == .constant) sym.const_val else null;
-            },
-            .binary => |b| {
-                const l = const_int(b.lhs, scope) orelse return null;
-                const r = const_int(b.rhs, scope) orelse return null;
-                return switch (b.op) {
-                    .add => std.math.add(u64, l, r) catch null,
-                    .sub => std.math.sub(u64, l, r) catch null,
-                    .mul => std.math.mul(u64, l, r) catch null,
-                    .div => if (r == 0) null else l / r,
-                    .mod => if (r == 0) null else l % r,
-                    .shl => if (r >= 64) null else l << @intCast(r),
-                    .shr => if (r >= 64) null else l >> @intCast(r),
-                    else => null,
-                };
-            },
-            else => return null,
-        }
     }
 };

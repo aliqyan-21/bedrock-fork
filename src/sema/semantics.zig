@@ -1,10 +1,17 @@
+// Item rule of thumb:  declare_*  = build the signature / type and put it in scope
+//                      check_*    = check the body against that signature
+
 const std = @import("std");
 const ast = @import("../ast.zig");
 const compiler = @import("../compiler.zig");
-const err = @import("../error.zig");
 const scope = @import("scope.zig");
 const types = @import("type_system.zig");
+const lower_type = @import("lower_type.zig");
+const expr_mod = @import("expr.zig");
+const stmt_mod = @import("stmt.zig");
 const Token = @import("../token.zig").Token;
+
+const TypeId = types.TypeId;
 
 pub const Sema = struct {
     compiler: *compiler.Compiler,
@@ -28,7 +35,6 @@ pub const Sema = struct {
     }
 
     pub fn analyze(self: *Sema) !void {
-        // std.debug.print("\n-------\nanalyzing semantics!\n--------\n", .{});
         var root = scope.Scope.init(self.compiler.allocator, .root, null);
         defer root.deinit();
         self.scope = &root;
@@ -39,24 +45,53 @@ pub const Sema = struct {
         }
     }
 
-    fn enter_scope(self: *Sema, stmts: []ast.Stmt, kind: scope.Scope.Id) !void {
-        var block_scope = scope.Scope.init(self.compiler.allocator, kind, self.scope);
-        defer block_scope.deinit();
+    // --- helpers shared by every sema file ---
 
-        const saved = self.scope;
-        self.scope = &block_scope;
-        defer self.scope = saved;
-
-        for (stmts, 0..) |*stmt, idx| {
-            if (idx > 0 and self.types.body_returns(stmts[0..idx])) {
-                if (stmt.token_of()) |tok| {
-                    try self.compiler.add_sem_error("unreachable code", .{}, .Error, tok);
-                }
-                break;
-            }
-            try self.visit_statement(stmt);
-        }
+    pub fn err(self: *Sema, comptime fmt: []const u8, args: anytype, tok: Token) !void {
+        try self.compiler.add_sem_error(fmt, args, .Error, tok);
     }
+
+    pub fn warn(self: *Sema, comptime fmt: []const u8, args: anytype, tok: Token) !void {
+        try self.compiler.add_sem_error(fmt, args, .Warn, tok);
+    }
+
+    // declare in the current scope.
+    // reports "Duplicate <what>: name" on a clash
+    pub fn declare_as(self: *Sema, comptime what: []const u8, sym: scope.Symbol, tok: Token) !void {
+        self.scope.declare(sym) catch |e| switch (e) {
+            error.DuplicateName => try self.err("Duplicate " ++ what ++ ": {s}", .{sym.name}, tok),
+            else => return e,
+        };
+    }
+
+    pub fn declare(self: *Sema, sym: scope.Symbol, tok: Token) !void {
+        try self.declare_as("declaration", sym, tok);
+    }
+
+    // just turn struct and field to struct.field
+    pub fn qualify(self: *Sema, owner: []const u8, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.types.arena.allocator(), "{s}.{s}", .{ owner, name });
+    }
+
+    pub fn resolve_type(self: *Sema, ty: *ast.Type) !TypeId {
+        return lower_type.resolve(&self.types, self.scope, ty);
+    }
+
+    // thin entry points so other sema files don't import each other's internals
+    pub fn check_expr(self: *Sema, e: *ast.Expr, expected: ?TypeId) anyerror!TypeId {
+        return expr_mod.check(self, e, expected);
+    }
+
+    pub fn check_stmt(self: *Sema, st: *ast.Stmt) anyerror!void {
+        return stmt_mod.check_stmt(self, st);
+    }
+
+    // check `stmts` inside a fresh child scope of the given kind
+    pub fn enter_scope(self: *Sema, stmts: []ast.Stmt, kind: scope.Scope.Id) anyerror!void {
+        return stmt_mod.block(self, stmts, kind);
+    }
+
+    // --- bindings: var / const / static, at top level and inside bodies ---
 
     fn check_undefined_array_infer(type_ann: ?*ast.Type, value: *ast.Expr) bool {
         if (type_ann) |ty| if (ty.base == .array and ty.base.array.size == .inferred and value.* == .undefined) {
@@ -65,54 +100,146 @@ pub const Sema = struct {
         return false;
     }
 
-    fn declare_func(self: *Sema, f: *ast.FunctionDef, name: []const u8) !void {
-        var param_tys = std.ArrayList(types.TypeId).empty;
-        for (f.params.items) |*param| {
-            const pty = try self.types.resolve_type(param.type, self.scope);
-            if (pty == .invalid) {
-                try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
+    pub fn check_binding(
+        self: *Sema,
+        comptime kind: scope.SymbolKind, // .variable or .constant
+        name: []const u8,
+        type_ann: ?*ast.Type,
+        value: *ast.Expr,
+        tok: Token,
+    ) !void {
+        const what = comptime if (kind == .constant) "constant" else "variable";
+
+        const dty: TypeId = if (type_ann) |ty| blk: {
+            const t = try self.resolve_type(ty);
+            const inferred = ty.base == .array and ty.base.array.size == .inferred;
+            if (t == .invalid and !inferred) {
+                try self.err("unknown type for " ++ what ++ " '{s}'", .{name}, ty.token);
             }
-            try param_tys.append(self.compiler.allocator, pty);
+            break :blk t;
+        } else .invalid;
+
+        if (kind == .constant and value.* == .undefined) {
+            try self.err("constant '{s}' cannot be 'undefined'", .{name}, tok);
         }
-        const rty = try self.types.resolve_type(f.result, self.scope);
+
+        const aty: TypeId = if (check_undefined_array_infer(type_ann, value)) blk: {
+            try self.err("cannot infer array length: 'undefined' has no length to infer from", .{}, tok);
+            break :blk .invalid;
+        } else try self.check_expr(value, types.hint(dty));
+
+        if (dty != .invalid and aty != .invalid and !self.types.assignable(aty, dty)) {
+            try self.err("type mismatch: expected {s}, found {s}", .{ self.types.name_of(dty), self.types.name_of(aty) }, tok);
+        }
+
+        try self.declare(.{
+            .name = name,
+            .kind = kind,
+            .ty = if (dty != .invalid) dty else aty,
+            .const_val = if (kind == .constant) lower_type.const_int(value, self.scope) else null,
+        }, tok);
+    }
+
+    // --- signatures ---
+
+    // resolve parameter types (params: slice of the AST param type)
+    fn param_types(self: *Sema, params: anytype) !std.ArrayList(TypeId) {
+        var out: std.ArrayList(TypeId) = .empty;
+        errdefer out.deinit(self.compiler.allocator);
+        for (params) |*param| {
+            const pty = try self.resolve_type(param.type);
+            if (pty == .invalid) {
+                try self.err("unknown type for parameter '{s}'", .{param.name}, param.token);
+            }
+            try out.append(self.compiler.allocator, pty);
+        }
+        return out;
+    }
+
+    fn func_type(
+        self: *Sema,
+        params: anytype,
+        result: *ast.Type,
+        name: []const u8,
+        comptime what: []const u8, // "function" / "extern func", only used in the error text
+        result_tok: Token,
+        is_variadic: bool,
+    ) !TypeId {
+        var ptys = try self.param_types(params);
+        errdefer ptys.deinit(self.compiler.allocator);
+        const rty = try self.resolve_type(result);
         if (rty == .invalid) {
-            try self.compiler.add_sem_error("unknown return type for function '{s}'", .{name}, .Error, f.result.token);
+            try self.err("unknown return type for " ++ what ++ " '{s}'", .{name}, result_tok);
         }
-        const fnty = try self.types.intern(.{ .function = .{ .params = param_tys, .result = rty } });
-        self.scope.declare(.{ .name = name, .kind = .func, .ty = fnty }) catch |e| {
-            if (e == error.DuplicateName) {
-                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{name}, .Error, f.token);
-            }
-        };
+        return self.types.intern(.{ .function = .{ .params = ptys, .result = rty, .is_variadic = is_variadic } });
     }
 
-    fn declare_proc(self: *Sema, p: *ast.ProcDef, name: []const u8) !void {
-        var param_tys = std.ArrayList(types.TypeId).empty;
-        for (p.params.items) |*param| {
-            const pty = try self.types.resolve_type(param.type, self.scope);
-            if (pty == .invalid) {
-                try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
-            }
-            try param_tys.append(self.compiler.allocator, pty);
-        }
-        const prty = try self.types.intern(.{ .procedure = .{ .params = param_tys } });
-        self.scope.declare(.{ .name = name, .kind = .func, .ty = prty }) catch |e| {
-            if (e == error.DuplicateName) {
-                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{name}, .Error, p.token);
-            }
-        };
+    fn proc_type(self: *Sema, params: anytype, is_variadic: bool) !TypeId {
+        var ptys = try self.param_types(params);
+        errdefer ptys.deinit(self.compiler.allocator);
+        return self.types.intern(.{ .procedure = .{ .params = ptys, .is_variadic = is_variadic } });
     }
 
-    // just turn struct and field to struct.field
-    pub fn qualify(self: *Sema, owner: []const u8, name: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.types.arena.allocator(), "{s}.{s}", .{ owner, name });
+    fn declare_func(self: *Sema, f: *ast.FunctionDef, name: []const u8) !TypeId {
+        const fnty = try self.func_type(f.params.items, f.result, name, "function", f.result.token, false);
+        try self.declare(.{ .name = name, .kind = .func, .ty = fnty }, f.token);
+        return fnty;
+    }
+
+    fn declare_proc(self: *Sema, p: *ast.ProcDef, name: []const u8) !TypeId {
+        const prty = try self.proc_type(p.params.items, false);
+        try self.declare(.{ .name = name, .kind = .func, .ty = prty }, p.token);
+        return prty;
+    }
+
+    fn declare_extern(self: *Sema, e_def: anytype) !void {
+        switch (e_def.kind) {
+            .func => |f| {
+                const fnty = try self.func_type(f.params.items, f.result, f.name, "extern func", e_def.token, f.is_variadic);
+                try self.declare(.{ .name = f.name, .kind = .func, .ty = fnty }, e_def.token);
+            },
+            .proc => |p| {
+                const prty = try self.proc_type(p.params.items, p.is_variadic);
+                try self.declare(.{ .name = p.name, .kind = .func, .ty = prty }, e_def.token);
+            },
+        }
+    }
+
+    // --- type definitions ---
+
+    fn declare_struct(self: *Sema, s: *ast.StructDef) !void {
+        const alloc = self.compiler.allocator;
+        var field_tys: std.ArrayList(types.StFieldTy) = .empty;
+        errdefer field_tys.deinit(alloc);
+        for (s.fields.items) |*s_f| {
+            const fty = try self.resolve_type(s_f.type);
+            if (fty == .invalid) {
+                try self.err("unknown type for field '{s}'", .{s_f.name}, s_f.token);
+            }
+            try field_tys.append(alloc, .{ .name = s_f.name, .ty = fty });
+        }
+
+        const sty = try self.types.intern(.{ .struct_ty = .{ .name = s.name, .fields = field_tys } });
+        try self.types.register(s.name, sty);
+        try self.declare(.{ .name = s.name, .kind = .@"struct", .ty = sty }, s.token);
+    }
+
+    fn check_duplicate_fields(self: *Sema, s: *ast.StructDef) !void {
+        var seen = std.StringHashMap(void).init(self.compiler.allocator);
+        defer seen.deinit();
+        for (s.fields.items) |f| {
+            const slot = try seen.getOrPut(f.name);
+            if (slot.found_existing) {
+                try self.err("Duplicate struct field: {s}", .{f.name}, s.token);
+            }
+        }
     }
 
     // checks if method and field name clashes and give errors
-    fn check_method(self: *Sema, s: *ast.StructDef, name: []const u8, tok: Token) !void {
+    fn check_method_clash(self: *Sema, s: *ast.StructDef, name: []const u8, tok: Token) !void {
         for (s.fields.items) |f| {
             if (std.mem.eql(u8, f.name, name)) {
-                try self.compiler.add_sem_error("method '{s}' clashes with the field of the same name", .{name}, .Error, tok);
+                try self.err("method '{s}' clashes with the field of the same name", .{name}, tok);
             }
         }
     }
@@ -121,1123 +248,139 @@ pub const Sema = struct {
     // of all methods in struct (so methods can call
     // each other in any order) then again we do pass
     // and this time we visit the bodies of methods.
-    fn visit_method(self: *Sema, s: *ast.StructDef) !void {
+    fn visit_methods(self: *Sema, s: *ast.StructDef) !void {
+        const alloc = self.compiler.allocator;
+        var sigs: std.ArrayList(TypeId) = .empty;
+        defer sigs.deinit(alloc);
+
         for (s.methods.items) |*m| switch (m.*) {
             .func => |*f| {
-                try self.check_method(s, f.name, f.token);
-                try self.declare_func(f, try self.qualify(s.name, f.name));
+                try self.check_method_clash(s, f.name, f.token);
+                try sigs.append(alloc, try self.declare_func(f, try self.qualify(s.name, f.name)));
             },
             .proc => |*p| {
-                try self.check_method(s, p.name, p.token);
-                try self.declare_proc(p, try self.qualify(s.name, p.name));
+                try self.check_method_clash(s, p.name, p.token);
+                try sigs.append(alloc, try self.declare_proc(p, try self.qualify(s.name, p.name)));
             },
         };
-        for (s.methods.items) |*m| switch (m.*) {
-            .func => |*f| try self.visit_function(f),
-            .proc => |*p| try self.visit_proc(p),
+        for (s.methods.items, sigs.items) |*m, sig| switch (m.*) {
+            .func => |*f| try self.check_function(f, sig),
+            .proc => |*p| try self.check_proc(p, sig),
         };
     }
 
-    // it gets the struct type of a pointer struct
-    // and a normal struct so (self: *P) and (self: P)
-    // could be called in same way (p.foo()) and not (&p.foo())
-    fn struct_of(self: *Sema, tty: types.TypeId) types.TypeId {
-        if (tty == .invalid) return .invalid;
-        return switch (self.types.get(tty).*) {
-            .struct_ty, .enum_ty => tty,
-            .pointer => |p| if (p.child != .invalid and self.types.get(p.child).* == .struct_ty) p.child else .invalid,
-            else => .invalid,
-        };
+    fn visit_struct(self: *Sema, s: *ast.StructDef) !void {
+        try self.declare_struct(s);
+        try self.check_duplicate_fields(s);
+        try self.visit_methods(s);
     }
 
+    // `en` / `a`: payloads of the enum_def / alias type_def variants
+    fn declare_enum(self: *Sema, en: anytype) !void {
+        const alloc = self.compiler.allocator;
+        var variants: std.ArrayList(types.EnumVaraintTy) = .empty;
+        for (en.variants.items) |*v| {
+            for (variants.items) |vt| {
+                if (std.mem.eql(u8, vt.name, v.name)) {
+                    try self.err("Duplicate variant name: {s}", .{v.name}, v.token);
+                }
+            }
+            var tys: std.ArrayList(TypeId) = .empty;
+            for (v.types.items) |t| {
+                try tys.append(alloc, try self.resolve_type(t));
+            }
+            try variants.append(alloc, .{ .name = v.name, .types = tys });
+        }
+
+        const ety = try self.types.intern(.{ .enum_ty = .{ .name = en.name, .variants = variants } });
+        try self.types.register(en.name, ety);
+        try self.declare(.{ .name = en.name, .kind = .@"enum", .ty = ety }, en.token);
+
+        // each variant is also a constructor function: Enum.Variant(payload...) -> Enum
+        const edef = self.types.get(ety).enum_ty;
+        for (edef.variants.items) |v| {
+            const ctorty = try self.types.intern(.{ .function = .{
+                .params = try v.types.clone(alloc),
+                .result = ety,
+            } });
+            // duplicate variants were already reported above
+            self.scope.declare(.{ .name = try self.qualify(en.name, v.name), .kind = .enum_variant, .ty = ctorty }) catch |e| {
+                if (e != error.DuplicateName) return e;
+            };
+        }
+    }
+
+    fn declare_alias(self: *Sema, a: anytype) !void {
+        const aty = try self.resolve_type(a.ty);
+        if (aty == .invalid) {
+            try self.err("cannot resolve aliased type for `{s}`", .{a.name}, a.token);
+        }
+        try self.types.register(a.name, aty);
+        try self.declare(.{ .name = a.name, .kind = .type_alias, .ty = aty }, a.token);
+    }
+
+    // --- bodies ---
+
+    // shared by functions and procs: params in a .func scope, body in a nested block
+    fn check_fn_body(
+        self: *Sema,
+        params: anytype,
+        param_tys: []const TypeId, // already resolved by declare_*, so no second resolution here
+        body: []ast.Stmt,
+        info: scope.FnInfo,
+    ) !void {
+        var fn_scope = scope.Scope.init(self.compiler.allocator, .func, self.scope);
+        fn_scope.fn_info = info;
+        defer fn_scope.deinit();
+        const saved = self.scope;
+        self.scope = &fn_scope;
+        defer self.scope = saved;
+
+        for (params, param_tys) |*param, pty| {
+            const kind: scope.SymbolKind = if (param.is_const) .constant else .variable;
+            try self.declare_as("parameter", .{ .name = param.name, .kind = kind, .ty = pty }, param.token);
+        }
+
+        try self.enter_scope(body, .block);
+    }
+
+    fn check_function(self: *Sema, f: *ast.FunctionDef, fnty: TypeId) !void {
+        const sig = self.types.get(fnty).function;
+        try self.check_fn_body(f.params.items, sig.params.items, f.body.items, .{ .func = sig.result });
+
+        if (sig.result != .invalid and !stmt_mod.body_returns(f.body.items)) {
+            try self.warn("control reaches the end of the function", .{}, f.token);
+        }
+    }
+
+    fn check_proc(self: *Sema, p: *ast.ProcDef, prty: TypeId) !void {
+        const sig = self.types.get(prty).procedure;
+        try self.check_fn_body(p.params.items, sig.params.items, p.body.items, .proc);
+    }
+
+    // --- ITEMS ---
+
+    // Items are declared and checked one after another, so an
+    // item can only use items above it for now.
     fn visit_item(self: *Sema, item: *ast.Item) !void {
         switch (item.*) {
             .import_def => {},
             .function => |*f| {
-                try self.declare_func(f, f.name);
-                try self.visit_function(f);
+                const fnty = try self.declare_func(f, f.name);
+                try self.check_function(f, fnty);
             },
             .proc => |*p| {
-                try self.declare_proc(p, p.name);
-                try self.visit_proc(p);
+                const prty = try self.declare_proc(p, p.name);
+                try self.check_proc(p, prty);
             },
-            .type_def => |*t_def| {
-                switch (t_def.variant) {
-                    .struct_def => |*s| {
-                        var field_tys = std.ArrayList(types.StFieldTy).empty;
-                        for (s.fields.items) |*s_f| {
-                            const fty = try self.types.resolve_type(s_f.type, self.scope);
-                            if (fty == .invalid) {
-                                try self.compiler.add_sem_error("unknown type for field '{s}'", .{s_f.name}, .Error, s_f.token);
-                            }
-                            try field_tys.append(self.compiler.allocator, .{ .name = s_f.name, .ty = fty });
-                        }
-
-                        const sty = try self.types.intern(.{ .struct_ty = .{ .name = s.name, .fields = field_tys } });
-                        try self.types.register(s.name, sty);
-                        self.scope.declare(.{ .name = s.name, .kind = .@"struct", .ty = sty }) catch |e| {
-                            if (e == error.DuplicateName) {
-                                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{s.name}, .Error, s.token);
-                            }
-                        };
-
-                        try self.visit_struct_def(s);
-                        try self.visit_method(s);
-                    },
-                    .enum_def => |*en| {
-                        var vartys = std.ArrayList(types.EnumVaraintTy).empty;
-                        for (en.variants.items) |*v| {
-                            for (vartys.items) |vt| {
-                                if (std.mem.eql(u8, vt.name, v.name)) {
-                                    try self.compiler.add_sem_error("Duplicate variant name: {s}\n", .{v.name}, .Error, v.token);
-                                }
-                            }
-                            var tys = std.ArrayList(types.TypeId).empty;
-                            for (v.types.items) |t| {
-                                try tys.append(self.compiler.allocator, try self.types.resolve_type(t, self.scope));
-                            }
-                            try vartys.append(self.compiler.allocator, .{ .name = v.name, .types = tys });
-                        }
-
-                        const ety = try self.types.intern(.{ .enum_ty = .{ .name = en.name, .variants = vartys } });
-                        try self.types.register(en.name, ety);
-                        self.scope.declare(.{ .name = en.name, .kind = .@"enum", .ty = ety }) catch |e| {
-                            if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate declaration: {s}", .{en.name}, .Error, en.token);
-                        };
-                        const edef = self.types.get(ety).enum_ty;
-                        for (edef.variants.items) |v| {
-                            const ctorty = try self.types.intern(.{ .function = .{
-                                .params = try v.types.clone(self.compiler.allocator),
-                                .result = ety,
-                            } });
-                            self.scope.declare(.{ .name = try self.qualify(en.name, v.name), .kind = .enum_variant, .ty = ctorty }) catch |e| {
-                                if (e != error.DuplicateName) return e;
-                            };
-                        }
-                    },
-                    .alias => |*a| {
-                        const aty = try self.types.resolve_type(a.ty, self.scope);
-                        if (aty == .invalid) {
-                            try self.compiler.add_sem_error("cannot resolve aliased type for `{s}`", .{a.name}, .Error, a.token);
-                        }
-                        try self.types.register(a.name, aty);
-                        self.scope.declare(.{ .name = a.name, .kind = .type_alias, .ty = aty }) catch |e| {
-                            if (e == error.DuplicateName) {
-                                try self.compiler.add_sem_error("Duplicate declaration: {s}", .{a.name}, .Error, a.token);
-                            }
-                        };
-                    },
-                }
+            .type_def => |*t_def| switch (t_def.variant) {
+                .struct_def => |*s| try self.visit_struct(s),
+                .enum_def => |*en| try self.declare_enum(en),
+                .alias => |*a| try self.declare_alias(a),
             },
-            .extern_def => |e_def| {
-                switch (e_def.kind) {
-                    .func => |f| {
-                        var param_tys = std.ArrayList(types.TypeId).empty;
-                        for (f.params.items) |*param| {
-                            const pty = try self.types.resolve_type(param.type, self.scope);
-                            if (pty == .invalid) {
-                                try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
-                            }
-                            try param_tys.append(self.compiler.allocator, pty);
-                        }
-                        const rty = try self.types.resolve_type(f.result, self.scope);
-                        if (rty == .invalid) {
-                            try self.compiler.add_sem_error("unknown return type for extern func '{s}'", .{f.name}, .Error, e_def.token);
-                        }
-                        const fnty = try self.types.intern(.{ .function = .{ .params = param_tys, .result = rty, .is_variadic = f.is_variadic } });
-                        self.scope.declare(.{ .name = f.name, .kind = .func, .ty = fnty }) catch |e| {
-                            if (e == error.DuplicateName) {
-                                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{f.name}, .Error, e_def.token);
-                            }
-                        };
-                    },
-                    .proc => |p| {
-                        var param_tys = std.ArrayList(types.TypeId).empty;
-                        for (p.params.items) |*param| {
-                            const pty = try self.types.resolve_type(param.type, self.scope);
-                            if (pty == .invalid) {
-                                try self.compiler.add_sem_error("unknown type for parameter '{s}'", .{param.name}, .Error, param.token);
-                            }
-                            try param_tys.append(self.compiler.allocator, pty);
-                        }
-                        const prty = try self.types.intern(.{ .procedure = .{ .params = param_tys, .is_variadic = p.is_variadic } });
-                        self.scope.declare(.{ .name = p.name, .kind = .func, .ty = prty }) catch |e| {
-                            if (e == error.DuplicateName) {
-                                try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{p.name}, .Error, e_def.token);
-                            }
-                        };
-                    },
-                }
-            },
-            .var_def => |*v| {
-                const dty: types.TypeId = if (v.type_ann) |ty| blk: {
-                    const t = try self.types.resolve_type(ty, self.scope);
-                    const inferred = ty.base == .array and ty.base.array.size == .inferred;
-                    if (t == .invalid and !inferred) {
-                        try self.compiler.add_sem_error("unknown type for variable '{s}'", .{v.name}, .Error, ty.token);
-                    }
-                    break :blk t;
-                } else .invalid;
-                const aty = if (check_undefined_array_infer(v.type_ann, v.value)) blk: {
-                    try self.compiler.add_sem_error("cannot infer array length: 'undefined' has no length to infer from", .{}, .Error, v.token);
-                    break :blk .invalid;
-                } else try self.visit_expression(v.value, if (dty != .invalid) dty else null);
-
-                if (dty != .invalid and aty != .invalid and !self.types.assignable(aty, dty)) {
-                    try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(dty), self.types.name_of(aty) }, .Error, v.token);
-                }
-                self.scope.declare(.{ .name = v.name, .kind = .variable, .ty = if (dty != .invalid) dty else aty }) catch |e| {
-                    if (e == error.DuplicateName) {
-                        try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{v.name}, .Error, v.token);
-                    }
-                };
-            },
-            .const_def => |*c| {
-                const dty: types.TypeId = if (c.type_ann) |ty| blk: {
-                    const t = try self.types.resolve_type(ty, self.scope);
-                    const inferred = ty.base == .array and ty.base.array.size == .inferred;
-                    if (t == .invalid and !inferred) {
-                        try self.compiler.add_sem_error("unknown type for constant '{s}'", .{c.name}, .Error, ty.token);
-                    }
-                    break :blk t;
-                } else .invalid;
-                if (c.value.* == .undefined) {
-                    try self.compiler.add_sem_error("constant '{s}' cannot be 'undefined'", .{c.name}, .Error, c.token);
-                }
-                const aty = if (check_undefined_array_infer(c.type_ann, c.value)) blk: {
-                    try self.compiler.add_sem_error("cannot infer array length: 'undefined' has no length to infer from", .{}, .Error, c.token);
-                    break :blk .invalid;
-                } else try self.visit_expression(c.value, if (dty != .invalid) dty else null);
-                if (dty != .invalid and aty != .invalid and !self.types.assignable(aty, dty)) {
-                    try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(dty), self.types.name_of(aty) }, .Error, c.token);
-                }
-                self.scope.declare(.{ .name = c.name, .kind = .constant, .ty = if (dty != .invalid) dty else aty, .const_val = types.TypeSystem.const_int(c.value, self.scope) }) catch |e| {
-                    if (e == error.DuplicateName) {
-                        try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{c.name}, .Error, c.token);
-                    }
-                };
-            },
+            .extern_def => |e_def| try self.declare_extern(e_def),
+            .var_def => |*v| try self.check_binding(.variable, v.name, v.type_ann, v.value, v.token),
+            .const_def => |*c| try self.check_binding(.constant, c.name, c.type_ann, c.value, c.token),
         }
     }
-
-    fn visit_struct_def(self: *Sema, s: *ast.StructDef) !void {
-        var s_scope = scope.Scope.init(self.compiler.allocator, .@"struct", self.scope);
-        defer s_scope.deinit();
-        const saved = self.scope;
-        self.scope = &s_scope;
-        defer self.scope = saved;
-
-        for (s.fields.items) |*f| {
-            const f_ty = try self.types.resolve_type(f.type, self.scope);
-            s_scope.declare(.{ .name = f.name, .kind = .st_field, .ty = f_ty }) catch |e| {
-                if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate struct field: {s}\n", .{f.name}, .Error, s.token);
-            };
-        }
-    }
-
-    fn visit_function(self: *Sema, func: *ast.FunctionDef) !void {
-        // std.debug.print("visiting function\n", .{});
-        const rty = try self.types.resolve_type(func.result, self.scope);
-
-        var func_scope = scope.Scope.init(self.compiler.allocator, .func, self.scope);
-        func_scope.fn_info = .{ .func = rty };
-        defer func_scope.deinit();
-        const saved = self.scope;
-        self.scope = &func_scope;
-        defer self.scope = saved;
-
-        for (func.params.items) |*param| {
-            const param_ty = try self.types.resolve_type(param.type, self.scope);
-            const kind: scope.SymbolKind = if (param.is_const) .constant else .variable;
-            func_scope.declare(.{ .name = param.name, .kind = kind, .ty = param_ty }) catch |e| {
-                if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate parameter: {s}\n", .{param.name}, .Error, param.token);
-            };
-        }
-
-        try self.enter_scope(func.body.items, .block);
-
-        if (rty != .invalid and !self.types.body_returns(func.body.items)) {
-            try self.compiler.add_sem_error("control reaches the end of the function", .{}, .Warn, func.token);
-        }
-    }
-
-    fn visit_proc(self: *Sema, proc: *ast.ProcDef) !void {
-        // std.debug.print("visiting proc\n", .{});
-        var proc_scope = scope.Scope.init(self.compiler.allocator, .func, self.scope);
-        proc_scope.fn_info = .proc;
-        defer proc_scope.deinit();
-        const saved = self.scope;
-        self.scope = &proc_scope;
-        defer self.scope = saved;
-
-        for (proc.params.items) |*param| {
-            const param_ty = try self.types.resolve_type(param.type, self.scope);
-            const kind: scope.SymbolKind = if (param.is_const) .constant else .variable;
-            proc_scope.declare(.{ .name = param.name, .kind = kind, .ty = param_ty }) catch |e| {
-                if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate parameter: {s}\n", .{param.name}, .Error, param.token);
-            };
-        }
-
-        try self.enter_scope(proc.body.items, .block);
-    }
-
-    // to find if the expression a place stored inline in an array for now
-    // todo: could be expanded to structs, slice, etc.
-    fn is_inline_value(self: *Sema, e: *ast.Expr) bool {
-        const t = self.expr_types.get(e) orelse return false;
-        if (t == .invalid) return false;
-        return switch (self.types.get(t).*) {
-            .array => true,
-            else => false,
-        };
-    }
-
-    // to find name of const owning this place
-    fn const_root(self: *Sema, e: *ast.Expr) ?[]const u8 {
-        return switch (e.*) {
-            .ident => |i| blk: {
-                const sym = self.scope.resolve(i.name) orelse break :blk null;
-                break :blk if (sym.kind == .constant) sym.name else null;
-            },
-            .field_access => |f| if (self.is_inline_value(f.target)) self.const_root(f.target) else null,
-            .index => |i| if (self.is_inline_value(i.target)) self.const_root(i.target) else null,
-            else => null,
-        };
-    }
-
-    fn visit_statement(self: *Sema, stmt: *ast.Stmt) anyerror!void {
-        // std.debug.print("visiting statement\n", .{});
-        switch (stmt.*) {
-            .var_stmt => |*v| {
-                const dty: types.TypeId = if (v.type_ann) |ty| blk: {
-                    const t = try self.types.resolve_type(ty, self.scope);
-                    const inferred = ty.base == .array and ty.base.array.size == .inferred;
-                    if (t == .invalid and !inferred) {
-                        try self.compiler.add_sem_error("unknown type for variable '{s}'", .{v.name}, .Error, ty.token);
-                    }
-                    break :blk t;
-                } else .invalid;
-                const aty = if (check_undefined_array_infer(v.type_ann, v.value)) blk: {
-                    try self.compiler.add_sem_error("cannot infer array length: 'undefined' has no length to infer from", .{}, .Error, v.token);
-                    break :blk .invalid;
-                } else try self.visit_expression(v.value, if (dty != .invalid) dty else null);
-
-                if (dty != .invalid and aty != .invalid and !self.types.assignable(aty, dty)) {
-                    try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(dty), self.types.name_of(aty) }, .Error, v.token);
-                }
-                self.scope.declare(.{ .name = v.name, .kind = .variable, .ty = if (dty != .invalid) dty else aty }) catch |e| {
-                    if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{v.name}, .Error, v.token);
-                };
-            },
-            .const_stmt => |*c| {
-                const dty: types.TypeId = if (c.type_ann) |ty| blk: {
-                    const t = try self.types.resolve_type(ty, self.scope);
-                    const inferred = ty.base == .array and ty.base.array.size == .inferred;
-                    if (t == .invalid and !inferred) {
-                        try self.compiler.add_sem_error("unknown type for constant '{s}'", .{c.name}, .Error, ty.token);
-                    }
-                    break :blk t;
-                } else .invalid;
-                if (c.value.* == .undefined) {
-                    try self.compiler.add_sem_error("constant '{s}' cannot be 'undefined'", .{c.name}, .Error, c.token);
-                }
-                const aty = if (check_undefined_array_infer(c.type_ann, c.value)) blk: {
-                    try self.compiler.add_sem_error("cannot infer array length: 'undefined' has no length to infer from", .{}, .Error, c.token);
-                    break :blk .invalid;
-                } else try self.visit_expression(c.value, if (dty != .invalid) dty else null);
-                if (dty != .invalid and aty != .invalid and !self.types.assignable(aty, dty)) {
-                    try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(dty), self.types.name_of(aty) }, .Error, c.token);
-                }
-                self.scope.declare(.{ .name = c.name, .kind = .constant, .ty = if (dty != .invalid) dty else aty, .const_val = types.TypeSystem.const_int(c.value, self.scope) }) catch |e| {
-                    if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{c.name}, .Error, c.token);
-                };
-            },
-            .local_static_var_stmt => |lv| {
-                const dty: types.TypeId = if (lv.type_ann) |ty| blk: {
-                    const t = try self.types.resolve_type(ty, self.scope);
-                    const inferred = ty.base == .array and ty.base.array.size == .inferred;
-                    if (t == .invalid and !inferred) {
-                        try self.compiler.add_sem_error("unknown type for variable '{s}'", .{lv.name}, .Error, ty.token);
-                    }
-                    break :blk t;
-                } else .invalid;
-                const aty = if (check_undefined_array_infer(lv.type_ann, lv.value)) blk: {
-                    try self.compiler.add_sem_error("cannot infer array length: 'undefined' has no length to infer from", .{}, .Error, lv.token);
-                    break :blk .invalid;
-                } else try self.visit_expression(lv.value, if (dty != .invalid) dty else null);
-                if (dty != .invalid and aty != .invalid and !self.types.assignable(aty, dty)) {
-                    try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(dty), self.types.name_of(aty) }, .Error, lv.token);
-                }
-                self.scope.declare(.{ .name = lv.name, .kind = .variable, .ty = if (dty != .invalid) dty else aty }) catch |e| {
-                    if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate declaration: {s}\n", .{lv.name}, .Error, lv.token);
-                };
-            },
-            .assign_stmt => |*a| {
-                const is_discard = a.target.* == .ident and std.mem.eql(u8, a.target.ident.name, "_");
-                if (is_discard) {
-                    _ = try self.visit_expression(a.value, null);
-                } else {
-                    const tty = try self.visit_expression(a.target, null);
-                    if (self.const_root(a.target)) |name| {
-                        try self.compiler.add_sem_error("cannot assign to constant '{s}'", .{name}, .Error, a.token);
-                    }
-                    const vty = try self.visit_expression(a.value, if (tty != .invalid) tty else null);
-                    if (tty != .invalid and vty != .invalid and !self.types.assignable(vty, tty)) {
-                        try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(tty), self.types.name_of(vty) }, .Error, a.target.token_of());
-                    }
-                }
-            },
-            .defer_stmt => |*d| {
-                try self.enter_scope(d.statement_list.items, .block);
-            },
-            .unsafe_stmt => |*u| {
-                try self.enter_scope(u.body.items, .unsafe);
-            },
-            .control_flow_stmt => |*c| try self.visit_control_flow(c),
-            .return_stmt => |*r| {
-                const fn_scope = self.scope.enclosing(.func);
-                // note: should we handle nil explicitly ??
-                if (fn_scope == null) {
-                    try self.compiler.add_sem_error("return used outside of function\n", .{}, .Error, r.token);
-                    _ = if (r.value) |val| try self.visit_expression(val, null);
-                } else if (fn_scope.?.fn_info) |i| switch (i) {
-                    .func => |rty| {
-                        if (r.value) |val| {
-                            const vty = try self.visit_expression(val, if (rty != .invalid) rty else null);
-                            if (rty != .invalid and !self.types.assignable(vty, rty)) {
-                                try self.compiler.add_sem_error("type mismatch expected {s}, found {s}", .{ self.types.name_of(rty), self.types.name_of(vty) }, .Error, r.token);
-                            }
-                        } else {
-                            try self.compiler.add_sem_error("return should return a value of type {s}", .{self.types.name_of(rty)}, .Error, r.token);
-                        }
-                    },
-                    .proc => {
-                        if (r.value) |val| {
-                            _ = try self.visit_expression(val, null);
-                            try self.compiler.add_sem_error("proc cannot return a value", .{}, .Error, r.token);
-                        }
-                    },
-                };
-            },
-            .expr_stmt => |*e| {
-                if (e.value) |val| {
-                    const tmp = self.discard;
-                    self.discard = true;
-                    defer self.discard = tmp;
-
-                    const ty = try self.visit_expression(val, null);
-                    // info: I could check here func/proc as func have
-                    // to always return a value and proc could never
-                    // but .invalid already does that shit if u think of it
-                    const is_wrong = ty != .invalid and val.* == .call;
-                    if (is_wrong) try self.compiler.add_sem_error("unused return value: use '_ = ...' to discard", .{}, .Error, val.call.token);
-                }
-            },
-            .break_stmt => |*b| {
-                if (self.scope.enclosing(.loop) == null) {
-                    try self.compiler.add_sem_error("break used outside of loop\n", .{}, .Error, b.token);
-                }
-            },
-            .continue_stmt => |*c| {
-                if (self.scope.enclosing(.loop) == null) {
-                    try self.compiler.add_sem_error("continue used outside of loop\n", .{}, .Error, c.token);
-                }
-            },
-            else => {},
-        }
-    }
-
-    fn visit_pattern(self: *Sema, pat: *ast.Pattern, sty: types.TypeId, tok: Token) !void {
-        if (sty == .invalid) return;
-        switch (pat.*) {
-            .integer => if (!self.types.literal_fits(.integer, sty)) {
-                try self.compiler.add_sem_error("integer pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, tok);
-            },
-            .boolean => if (!self.types.assignable(try self.types.primitive(.bool), sty)) {
-                try self.compiler.add_sem_error("bool pattern can't match a value of type {s}", .{self.types.name_of(sty)}, .Error, tok);
-            },
-            .variant => |*v| try self.visit_variant_pattern(v, sty),
-            .field_variant => |expr| try self.visit_field_variant_pattern(expr, sty),
-            else => {
-                // try pat.print(0);
-            }, // TODO
-        }
-    }
-
-    fn visit_variant_pattern(self: *Sema, v: *ast.VariantPattern, sty: types.TypeId) !void {
-        if (self.types.get(sty).* != .enum_ty) {
-            try self.compiler.add_sem_error("variant pattern '{s}' can't match a value of type  {s}", .{ v.name, self.types.name_of(sty) }, .Error, v.token);
-            return;
-        }
-        const edef = self.types.get(sty).enum_ty;
-        var vname = v.name;
-        if (std.mem.lastIndexOfScalar(u8, v.name, '.')) |dot| {
-            vname = v.name[dot + 1 ..];
-            const ename = v.name[0..dot];
-            const sym = self.scope.resolve(ename) orelse {
-                try self.compiler.add_sem_error("Unknown identifier: '{s}'", .{ename}, .Error, v.token);
-                return;
-            };
-            if ((sym.kind != .@"enum" and sym.kind != .type_alias) or sym.ty != sty) {
-                try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(sty), ename }, .Error, v.token);
-                return;
-            }
-        }
-
-        for (edef.variants.items) |ev| {
-            if (!std.mem.eql(u8, ev.name, vname)) continue;
-            return;
-        }
-        try self.compiler.add_sem_error("enum '{s}' has no variant '{s}'", .{ edef.name, vname }, .Error, v.token);
-    }
-
-    fn visit_field_variant_pattern(self: *Sema, expr: *ast.Expr, sty: types.TypeId) !void {
-        if (expr.* != .field_access) return;
-        const fa = expr.field_access;
-
-        const ename = switch (fa.target.*) {
-            .ident => |i| i.name,
-            else => {
-                try self.compiler.add_sem_error("expected enum name before '.'", .{}, .Error, fa.token);
-                return;
-            },
-        };
-
-        const vname = switch (fa.field.*) {
-            .ident => |i| i.name,
-            else => {
-                try self.compiler.add_sem_error("expected variant name after '.'", .{}, .Error, fa.token);
-                return;
-            },
-        };
-
-        var tmp = ast.VariantPattern{
-            .name = try std.fmt.allocPrint(self.types.arena.allocator(), "{s}.{s}", .{ ename, vname }),
-            .params = .empty,
-            .token = fa.token,
-        };
-
-        try self.visit_variant_pattern(&tmp, sty);
-    }
-
-    fn get_variant_name(pat: *ast.Pattern) ?[]const u8 {
-        return switch (pat.*) {
-            .variant => |v| if (std.mem.lastIndexOfScalar(u8, v.name, '.')) |dot| v.name[dot + 1 ..] else v.name,
-            .field_variant => |expr| if (expr.* == .field_access and expr.field_access.field.* == .ident) expr.field_access.field.ident.name else null,
-            else => null,
-        };
-    }
-
-    fn visit_control_flow(self: *Sema, stmt: *ast.ControlFlowStmt) !void {
-        // std.debug.print("visiting control flow\n", .{});
-        switch (stmt.*) {
-            .if_expr => |*i| {
-                _ = try self.visit_expression(i.cond, null);
-                try self.enter_scope(i.then_body.items, .block);
-                for (i.elifs.items) |*e| {
-                    _ = try self.visit_expression(e.cond, null);
-                    try self.enter_scope(e.body.items, .block);
-                }
-                if (i.else_body) |*body| {
-                    try self.enter_scope(body.items, .block);
-                }
-            },
-            .match_expr => |*m| {
-                const sty = try self.visit_expression(m.subject, null);
-
-                // using hashmap to track that if all the enum variants are used.
-                // could there be a better way to do this?
-                var covered = std.StringHashMap(void).init(self.compiler.allocator);
-                defer covered.deinit();
-
-                for (m.arms.items) |*arm| {
-                    try self.visit_pattern(&arm.pattern, sty, arm.token);
-                    if (sty != .invalid and self.types.get(sty).* == .enum_ty) {
-                        if (get_variant_name(&arm.pattern)) |vname| {
-                            try covered.put(vname, {});
-                        }
-                    }
-                    try self.enter_scope(arm.body.items, .block);
-                }
-
-                if (sty != .invalid and self.types.get(sty).* == .enum_ty and m.else_body == null) {
-                    const edef = self.types.get(sty).enum_ty;
-                    for (edef.variants.items) |ev| {
-                        if (!covered.contains(ev.name)) {
-                            try self.compiler.add_sem_error("enumeration value '{s}' not handled in match", .{ev.name}, .Error, m.token);
-                        }
-                    }
-                }
-
-                if (m.else_body) |*body| {
-                    try self.enter_scope(body.items, .block);
-                }
-            },
-            .while_expr => |*w| {
-                _ = try self.visit_expression(w.cond, null);
-                try self.enter_scope(w.body.items, .loop);
-            },
-            .for_expr => |*f| {
-                const ity = try self.visit_expression(f.iterable, null);
-                const elemty: types.TypeId = if (ity == .invalid) .invalid else switch (self.types.get(ity).*) {
-                    .range => |r| r.elem,
-                    .array => |a| a.child,
-                    .slice => |s| s.child,
-                    else => blk: {
-                        try self.compiler.add_sem_error("cannot iterate over type {s}", .{self.types.name_of(ity)}, .Error, f.token);
-                        break :blk .invalid;
-                    },
-                };
-
-                var loop_scope = scope.Scope.init(self.compiler.allocator, .loop, self.scope);
-                defer loop_scope.deinit();
-                if (f.index_binding) |ib| {
-                    const ty = try self.types.primitive(.usize);
-                    const sty = try self.visit_expression(f.index_start.?, ty); // expeting the type of idx to be usize always
-                    if (sty != .invalid and !self.types.assignable(sty, ty)) {
-                        try self.compiler.add_sem_error("enumerate start must be usize, found {s}", .{self.types.name_of(sty)}, .Error, f.index_start.?.token_of());
-                    }
-                    loop_scope.declare(.{ .name = ib, .kind = .variable, .ty = ty }) catch |e| {
-                        if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate declaration: {s}", .{ib}, .Error, f.token);
-                    };
-                }
-
-                loop_scope.declare(.{ .name = f.binding, .kind = .variable, .ty = elemty }) catch |e| {
-                    if (e == error.DuplicateName) try self.compiler.add_sem_error("Duplicate declaration: {s}", .{f.binding}, .Error, f.token);
-                };
-
-                const tmp = self.scope;
-                self.scope = &loop_scope;
-                defer self.scope = tmp;
-
-                for (f.body.items) |*s| try self.visit_statement(s);
-            },
-        }
-    }
-
-    // check if expression is lvalue or not
-    fn is_lvalue(e: *ast.Expr) bool {
-        return switch (e.*) {
-            .ident, .field_access, .index => true,
-            .unary => |u| u.op == .deref,
-            else => false,
-        };
-    }
-
-    // method is dot callable only if it's first param is the struct (owner)
-    fn takes_reciever(self: *Sema, fnty: types.TypeId, owner: types.TypeId) bool {
-        const params = switch (self.types.get(fnty).*) {
-            .function => |f| f.params.items,
-            .procedure => |p| p.params.items,
-            else => return false,
-        };
-        if (params.len == 0 or params[0] == .invalid) return false;
-        const p0 = params[0];
-        return p0 == owner or (self.types.get(p0).* == .pointer and self.types.get(p0).pointer.child == owner);
-    }
-
-    // auto & and auto * so reciever mathces the method's first param
-    fn reciever_arg(self: *Sema, target: *ast.Expr, tty: types.TypeId, fnty: types.TypeId) !*ast.Expr {
-        const first = switch (self.types.get(fnty).*) {
-            .function => |f| f.params.items[0],
-            .procedure => |p| p.params.items[0],
-            else => unreachable,
-        };
-        const wantsptr = self.types.get(first).* == .pointer;
-        const isptr = self.types.get(tty).* == .pointer;
-        if (wantsptr == isptr) return target;
-
-        const e = try self.compiler.allocator.create(ast.Expr);
-        e.* = .{ .unary = .{ .op = if (wantsptr) .addr_of else .deref, .operand = target, .token = target.token_of() } };
-        return e;
-    }
-
-    // rewrite P.foo(a) into plain call to symbol "P.foo", so
-    // normal call checking does the method work too for us!
-    fn lower_method_call(self: *Sema, c: *ast.CallExpr) anyerror!bool {
-        const fa = c.callee.field_access;
-        const mname = switch (fa.field.*) {
-            .ident => |i| i.name,
-            else => return false,
-        };
-
-        var owner: types.TypeId = .invalid;
-        var tty: types.TypeId = .invalid;
-        const via_type = fa.target.* == .ident and blk: {
-            const sym = self.scope.resolve(fa.target.ident.name) orelse break :blk false;
-            if (sym.kind != .@"struct" and sym.kind != .@"enum") break :blk false;
-            owner = sym.ty;
-            break :blk true;
-        };
-        if (!via_type) {
-            tty = try self.visit_expression(fa.target, null);
-            if (tty == .invalid) return true;
-            owner = self.struct_of(tty);
-            if (owner == .invalid) return false;
-        }
-
-        const qname = try self.qualify(self.types.name_of(owner), mname);
-        const sym = self.scope.resolve(qname) orelse {
-            if (!via_type) return false;
-            if (self.types.get(owner).* == .enum_ty) {
-                try self.compiler.add_sem_error("enum '{s}' has no variant '{s}'", .{ self.types.name_of(owner), mname }, .Error, fa.token);
-            } else {
-                try self.compiler.add_sem_error("struct '{s}' has no method '{s}'", .{ self.types.name_of(owner), mname }, .Error, fa.token);
-            }
-            return true;
-        };
-
-        if (!via_type) {
-            if (!self.takes_reciever(sym.ty, owner)) {
-                try self.compiler.add_sem_error("'{s}' is a static method; call it as {s}.{s}(...)", .{ mname, self.types.name_of(owner), mname }, .Error, fa.token);
-                return true;
-            }
-            const recv = try self.reciever_arg(fa.target, tty, sym.ty);
-            try c.args.insert(self.compiler.allocator, 0, .{ .value = recv });
-        }
-
-        fa.field.deinit(self.compiler.allocator);
-        if (via_type) fa.target.deinit(self.compiler.allocator);
-
-        c.callee.* = .{ .ident = .{ .name = qname, .token = fa.token } };
-        return false;
-    }
-
-    fn visit_expression(self: *Sema, expr: *ast.Expr, expected: ?types.TypeId) !types.TypeId {
-        // std.debug.print("visiting expression\n", .{});
-        const ty = switch (expr.*) {
-            .literal => |*lit| blk: {
-                if (expected) |exp| {
-                    if (self.types.literal_fits(lit.kind, exp)) break :blk exp;
-                }
-                break :blk try self.types.literal_type(lit.kind);
-            },
-            .ident => |i| blk: {
-                const sym = self.scope.resolve(i.name) orelse {
-                    try self.compiler.add_sem_error("Unknown identifier '{s}'", .{i.name}, .Error, i.token);
-                    break :blk .invalid;
-                };
-                break :blk sym.ty;
-            },
-            .binary => |*b| blk: {
-                if (b.op == .range or b.op == .range_incl) {
-                    const lty = try self.visit_expression(b.lhs, expected);
-                    const rty = try self.visit_expression(b.rhs, expected orelse if (lty != .invalid) lty else null);
-                    const elemty = self.types.unify(lty, rty) orelse {
-                        try self.compiler.add_sem_error("range bounds must have the same type: {s} and {s}", .{ self.types.name_of(lty), self.types.name_of(rty) }, .Error, b.token);
-                        break :blk .invalid;
-                    };
-                    break :blk if (elemty == .invalid) .invalid else try self.types.intern(.{ .range = .{ .elem = elemty } });
-                }
-                if (b.op == .orelse_op) {
-                    break :blk .invalid; //todo: oresle unwrap
-                }
-                const is_logical = switch (b.op) {
-                    .logical_and, .logical_or => true,
-                    else => false,
-                };
-                const is_comparison = switch (b.op) {
-                    .eq, .ne, .lt, .gt, .le, .ge => true,
-                    else => false,
-                };
-
-                // implicit type conversion (numeric widening) is allowed for now
-                // those who need explicit type conversion give error here
-                if (is_logical) {
-                    const boolty = try self.types.primitive(.bool);
-                    const lty = try self.visit_expression(b.lhs, boolty);
-                    const rty = try self.visit_expression(b.rhs, boolty);
-                    if (lty != .invalid and !self.types.assignable(lty, boolty)) {
-                        try self.compiler.add_sem_error("expected bool, found {s}", .{self.types.name_of(lty)}, .Error, b.lhs.token_of());
-                    }
-                    if (lty != .invalid and !self.types.assignable(rty, boolty)) {
-                        try self.compiler.add_sem_error("expected bool, found {s}", .{self.types.name_of(rty)}, .Error, b.rhs.token_of());
-                    }
-                    break :blk boolty;
-                }
-
-                var lty: types.TypeId = undefined;
-                var rty: types.TypeId = undefined;
-                if (expected == null and b.lhs.* == .literal and b.rhs.* != .literal) {
-                    rty = try self.visit_expression(b.rhs, null);
-                    lty = try self.visit_expression(b.lhs, if (rty != .invalid) rty else null);
-                } else {
-                    lty = try self.visit_expression(b.lhs, expected);
-                    rty = try self.visit_expression(b.rhs, expected orelse if (lty != .invalid) lty else null);
-                }
-
-                const result_ty = self.types.unify(lty, rty) orelse {
-                    try self.compiler.add_sem_error("type mismatch in binary expression {s} and {s}", .{ self.types.name_of(lty), self.types.name_of(rty) }, .Error, b.token);
-                    break :blk .invalid;
-                };
-
-                break :blk if (is_comparison) try self.types.primitive(.bool) else result_ty;
-            },
-            .unary => |*u| blk: {
-                switch (u.op) {
-                    .neg => {
-                        const ty = try self.visit_expression(u.operand, expected);
-                        if (ty == .invalid) break :blk .invalid;
-
-                        const is_unsigned = switch (self.types.get(ty).*) {
-                            .primitive => |p| switch (p) {
-                                .u8, .u16, .u32, .u64, .usize => true,
-                                else => false,
-                            },
-                            else => false,
-                        };
-
-                        if (is_unsigned) {
-                            try self.compiler.add_sem_error("cannot negate value of unsiged type {s}", .{self.types.name_of(ty)}, .Error, u.token);
-                            break :blk .invalid;
-                        }
-
-                        if (!self.types.literal_fits(.integer, ty)) {
-                            try self.compiler.add_sem_error("cannot negate non-numeric type {s}", .{self.types.name_of(ty)}, .Error, u.token);
-                        }
-                        break :blk ty;
-                    },
-                    .not => {
-                        const ty = try self.visit_expression(u.operand, try self.types.primitive(.bool));
-                        if (ty != .invalid and !self.types.assignable(ty, try self.types.primitive(.bool))) {
-                            try self.compiler.add_sem_error("expected a bool, but found {s}", .{self.types.name_of(ty)}, .Error, u.token);
-                        }
-                        break :blk try self.types.primitive(.bool);
-                    },
-                    .bit_not => {
-                        const ty = try self.visit_expression(u.operand, expected);
-                        if (ty != .invalid) {
-                            const is_int = switch (self.types.get(ty).*) {
-                                .primitive => |p| switch (p) {
-                                    .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .usize, .isize => true,
-                                    else => false,
-                                },
-                                else => false,
-                            };
-                            if (!is_int) {
-                                try self.compiler.add_sem_error("cannot bitwise-not non-integer type {s}", .{self.types.name_of(ty)}, .Error, u.token);
-                            }
-                        }
-                        break :blk ty;
-                    },
-                    .addr_of => {
-                        if (!is_lvalue(u.operand)) {
-                            try self.compiler.add_sem_error("cannot take address of a non-lvalue expression", .{}, .Error, u.token);
-                            break :blk .invalid;
-                        }
-                        const innerty = try self.visit_expression(u.operand, null);
-                        if (!self.expr_types.contains(expr)) {
-                            if (self.const_root(u.operand)) |name| {
-                                try self.compiler.add_sem_error("cannot take the address of constant '{s}'", .{name}, .Error, u.token);
-                            }
-                        }
-                        break :blk if (innerty == .invalid) .invalid else try self.types.intern(.{ .pointer = .{ .child = innerty } });
-                    },
-                    .deref => {
-                        const ty = try self.visit_expression(u.operand, null);
-                        if (ty == .invalid) break :blk .invalid;
-                        break :blk switch (self.types.get(ty).*) {
-                            .pointer => |p| p.child,
-                            else => blk2: {
-                                try self.compiler.add_sem_error("cannot dereference non pointer type {s}", .{self.types.name_of(ty)}, .Error, u.token);
-                                break :blk2 .invalid;
-                            },
-                        };
-                    },
-                    .new => {
-                        const ty = try self.visit_expression(u.operand, null);
-                        if (ty == .invalid) break :blk .invalid;
-                        break :blk try self.types.intern(.{
-                            .pointer = .{
-                                .child = ty,
-                            },
-                        });
-                    },
-                }
-                return .invalid;
-            },
-            .field_access => |*fa| blk: {
-                const tty = try self.visit_expression(fa.target, null);
-                if (tty == .invalid) break :blk .invalid;
-
-                const stty = self.struct_of(tty);
-
-                switch (fa.field.*) {
-                    .ident => |id| {
-                        if (stty == .invalid) {
-                            try self.compiler.add_sem_error("cannot access field '{s}' on non-struct and non-enum type '{s}'", .{ id.name, self.types.name_of(tty) }, .Error, fa.token);
-                            break :blk .invalid;
-                        }
-
-                        const target_ty = self.types.get(stty).*;
-                        if (target_ty == .struct_ty) {
-                            const sdef = self.types.get(stty).struct_ty;
-                            for (sdef.fields.items) |sf| {
-                                if (std.mem.eql(u8, sf.name, id.name)) break :blk sf.ty;
-                            }
-                            try self.compiler.add_sem_error("struct '{s}' has no field '{s}'", .{ sdef.name, id.name }, .Error, fa.token);
-                            break :blk .invalid;
-                        } else if (target_ty == .enum_ty) {
-                            const edef = self.types.get(stty).enum_ty;
-                            for (edef.variants.items) |ef| {
-                                if (!std.mem.eql(u8, ef.name, id.name)) continue;
-                                // if target is enum variant then it's enum
-                                const via_type = fa.target.* == .ident and blk2: {
-                                    const s = self.scope.resolve(fa.target.ident.name) orelse break :blk2 false;
-                                    break :blk2 s.kind == .@"enum";
-                                };
-                                if (via_type) break :blk tty;
-
-                                // if payload then we take type off it
-                                switch (ef.types.items.len) {
-                                    0 => {
-                                        try self.compiler.add_sem_error("variant '{s}' of enum '{s}' has no payload to read", .{ ef.name, edef.name }, .Error, fa.token);
-                                        break :blk .invalid;
-                                    },
-                                    1 => break :blk ef.types.items[0],
-                                    else => {
-                                        // todo: could implement destructarizing multiple fields in multiple vars
-                                        try self.compiler.add_sem_error("variant '{s}' carries {d} values and can't be read as a single field", .{ ef.name, ef.types.items.len }, .Error, fa.token);
-                                        break :blk .invalid;
-                                    },
-                                }
-                            }
-                            try self.compiler.add_sem_error("enum '{s}' has no field '{s}'", .{ edef.name, id.name }, .Error, fa.token);
-                            break :blk .invalid;
-                        }
-                        break :blk .invalid;
-                    },
-                    else => {
-                        break :blk .invalid;
-                    },
-                }
-            },
-            .call => |*c| blk: {
-                const tmp = self.discard;
-                self.discard = false;
-
-                if (c.callee.* == .field_access and try self.lower_method_call(c)) break :blk .invalid;
-                const cty = try self.visit_expression(c.callee, null);
-                for (c.args.items) |arg| {
-                    _ = try self.visit_expression(arg.value, null);
-                }
-                if (cty == .invalid) break :blk .invalid;
-
-                break :blk switch (self.types.get(cty).*) {
-                    .function => |fnty| result: {
-                        if (fnty.is_variadic) {
-                            if (c.args.items.len < fnty.params.items.len) {
-                                try self.compiler.add_sem_error("expected atleast {d} arguments, found {d}", .{ fnty.params.items.len, c.args.items.len }, .Error, c.token);
-                            }
-                        } else if (c.args.items.len != fnty.params.items.len) {
-                            try self.compiler.add_sem_error("expected {d} arguments, found {d}", .{ fnty.params.items.len, c.args.items.len }, .Error, c.token);
-                            break :result fnty.result;
-                        } else {
-                            for (c.args.items, fnty.params.items) |arg, pty| {
-                                const argty = try self.visit_expression(arg.value, pty);
-                                if (argty != .invalid and !self.types.assignable(argty, pty)) {
-                                    try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(pty), self.types.name_of(argty) }, .Error, c.token);
-                                }
-                            }
-                        }
-                        break :result fnty.result;
-                    },
-                    .procedure => |prty| result: {
-                        if (prty.is_variadic) {
-                            if (c.args.items.len < prty.params.items.len) {
-                                try self.compiler.add_sem_error("expected atleast {d} arguments, found {d}", .{ prty.params.items.len, c.args.items.len }, .Error, c.token);
-                            }
-                        } else if (c.args.items.len != prty.params.items.len) {
-                            try self.compiler.add_sem_error("expected {d} arguments, found {d}", .{ prty.params.items.len, c.args.items.len }, .Error, c.token);
-                        } else {
-                            for (c.args.items, prty.params.items) |arg, pty| {
-                                const argty = try self.visit_expression(arg.value, pty);
-                                if (argty != .invalid and !self.types.assignable(argty, pty)) {
-                                    try self.compiler.add_sem_error("type mismatch: expected {s}, found {s}", .{ self.types.name_of(pty), self.types.name_of(argty) }, .Error, c.token);
-                                }
-                            }
-                        }
-                        if (!tmp) try self.compiler.add_sem_error("the call is of a proc, and there's no return value to store", .{}, .Error, c.token);
-                        break :result .invalid;
-                    },
-                    else => result: {
-                        try self.compiler.add_sem_error("cannot call non-function type {s}", .{self.types.name_of(cty)}, .Error, c.token);
-                        break :result .invalid;
-                    },
-                };
-            },
-            .index => |*i| blk: {
-                const tty = try self.visit_expression(i.target, null);
-                for (i.args.items) |arg| _ = try self.visit_expression(arg, null);
-
-                if (i.args.items.len != 1) break :blk .invalid; //todo: generics
-
-                if (tty == .invalid) break :blk .invalid;
-
-                break :blk switch (self.types.get(tty).*) {
-                    .array => |a| blk2: {
-                        // note: bound check is only for constants (which are known during comptime)
-                        const idx = i.args.items[0];
-                        const is_neg = idx.* == .unary and idx.unary.op == .neg;
-                        const lit: ?*ast.LiteralExpr = if (idx.* == .literal)
-                            &idx.literal
-                        else if (is_neg and idx.unary.operand.* == .literal)
-                            &idx.unary.operand.literal
-                        else
-                            null;
-
-                        if (lit) |l| {
-                            if (l.kind == .integer) {
-                                const n = l.ivalue;
-                                if (is_neg) {
-                                    try self.compiler.add_sem_error("index -{d} out of bounds of array of length {d}", .{ n, a.len }, .Error, idx.token_of());
-                                } else if (n >= a.len) {
-                                    try self.compiler.add_sem_error("index {d} out of bounds of array of length {d}", .{ n, a.len }, .Error, idx.token_of());
-                                }
-                            }
-                        }
-                        break :blk2 a.child;
-                    },
-                    .slice => |s| s.child,
-                    else => res: {
-                        try self.compiler.add_sem_error("cannot index type {s}", .{self.types.name_of(tty)}, .Error, i.token);
-                        break :res .invalid;
-                    },
-                };
-            },
-            .optional_unwrap => |*o| {
-                _ = try self.visit_expression(o.operand, null);
-                return .invalid; //todo: optianal type
-            },
-            .array_literal => |*al| blk: {
-                // note: if [1,2,3] becomes i32, and if we have [1,2,3,4.5] it gives error, so if
-                // want floats array have to do explicitly 'const a = [1.0, 2.0, 3.0]'
-                const hint: ?types.TypeId = if (expected) |exp| switch (self.types.get(exp).*) {
-                    .array => |*a| a.child,
-                    .slice => |s| s.child,
-                    else => null,
-                } else null;
-
-                if (al.elements.items.len == 0) {
-                    if (hint) |h| break :blk try self.types.intern(.{ .array = .{ .child = h, .len = 0 } });
-                    try self.compiler.add_sem_error("cannot infer type or size of empty array literal", .{}, .Error, al.token);
-                    break :blk .invalid;
-                }
-
-                var elemty: types.TypeId = hint orelse .invalid;
-
-                for (al.elements.items) |elem| {
-                    const want: ?types.TypeId = hint orelse (if (elemty != .invalid) elemty else null);
-                    const ety = try self.visit_expression(elem, want);
-                    if (ety == .invalid) continue;
-                    if (hint == null) {
-                        elemty = self.types.unify(elemty, ety) orelse {
-                            try self.compiler.add_sem_error(
-                                "array elements must have the same type: expected {s}, found {s}",
-                                .{ self.types.name_of(elemty), self.types.name_of(ety) },
-                                .Error,
-                                al.token,
-                            );
-                            break :blk .invalid;
-                        };
-                        continue;
-                    }
-                    if (!self.types.assignable(ety, elemty)) {
-                        try self.compiler.add_sem_error(
-                            "array elements must have the same type: expected {s}, found {s}",
-                            .{ self.types.name_of(elemty), self.types.name_of(ety) },
-                            .Error,
-                            al.token,
-                        );
-                    }
-                }
-
-                if (elemty == .invalid) break :blk .invalid;
-
-                break :blk try self.types.intern(.{ .array = .{ .child = elemty, .len = @intCast(al.elements.items.len) } });
-            },
-            .comptime_expr => |*ce| {
-                try self.enter_scope(ce.body.items, .block);
-                return .invalid; //todo: comptime type
-            },
-            .nil => |*n| blk: {
-                const fits = if (expected) |exp| switch (self.types.get(exp).*) {
-                    .optional => true,
-                    .error_union => |inner| self.types.get(inner).* == .optional,
-                    else => false,
-                } else false;
-
-                if (fits) break :blk expected.?;
-
-                try self.compiler.add_sem_error("cannot infer type of nil without context", .{}, .Error, n.token);
-                break :blk .invalid;
-            },
-            .undefined => blk: {
-                if (expected) |e| break :blk e;
-                try self.compiler.add_sem_error("cannot infer type of 'undefined' without context", .{}, .Error, expr.token_of());
-                break :blk .invalid;
-            },
-            .struct_literal => |*sl| blk: {
-                var stty: types.TypeId = .invalid;
-                if (std.mem.eql(u8, sl.name, "_")) {
-                    if (expected) |exp| {
-                        if (self.types.get(exp).* == .struct_ty) stty = exp;
-                    }
-                    if (stty == .invalid) {
-                        try self.compiler.add_sem_error("cannot infer struct type: no target type available", .{}, .Error, sl.token);
-                        break :blk .invalid;
-                    }
-                } else {
-                    const sym = self.scope.resolve(sl.name) orelse {
-                        try self.compiler.add_sem_error("unknown type '{s}'", .{sl.name}, .Error, sl.token);
-                        break :blk .invalid;
-                    };
-                    if (sym.kind != .@"struct") {
-                        try self.compiler.add_sem_error("'{s}' is not a struct type", .{sl.name}, .Error, sl.token);
-                        break :blk .invalid;
-                    }
-                    stty = sym.ty;
-                }
-
-                const sdef = self.types.get(stty).struct_ty;
-                var seen = std.StringHashMap(bool).init(self.compiler.allocator);
-                defer seen.deinit();
-
-                for (sl.field_inits.items) |*fi| {
-                    var flty: ?types.TypeId = null;
-                    for (sdef.fields.items) |f| {
-                        if (std.mem.eql(u8, f.name, fi.name)) {
-                            flty = f.ty;
-                            break;
-                        }
-                    }
-                    if (flty == null) {
-                        try self.compiler.add_sem_error("struct '{s}' has no field '{s}'", .{ sdef.name, fi.name }, .Error, fi.token);
-                        _ = try self.visit_expression(fi.value, null);
-                        continue;
-                    }
-                    if (seen.contains(fi.name)) {
-                        try self.compiler.add_sem_error("field '{s}' is initialized more than one time", .{fi.name}, .Error, fi.token);
-                    }
-                    try seen.put(fi.name, true);
-                    const vty = try self.visit_expression(fi.value, flty);
-                    if (vty != .invalid and !self.types.assignable(vty, flty.?)) {
-                        try self.compiler.add_sem_error("type mismatch for field '{s}': expected {s}, found {s}", .{ fi.name, self.types.name_of(flty.?), self.types.name_of(vty) }, .Error, fi.token);
-                    }
-                }
-                for (sdef.fields.items) |f| {
-                    if (!seen.contains(f.name)) {
-                        try self.compiler.add_sem_error("uninitialized field '{s}' in struct literal for '{s}'", .{ f.name, sdef.name }, .Error, sl.token);
-                    }
-                }
-                break :blk stty;
-            },
-        };
-        try self.expr_types.put(self.compiler.allocator, expr, ty);
-        return ty;
-    }
-
-    // note: so the structure is that we visit these different definitions and all the things
-    // like basically make visitors and check for our decided semantics...
-    // so progressively we keep developing the semantics here.
 };
