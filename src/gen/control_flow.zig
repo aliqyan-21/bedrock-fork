@@ -1,5 +1,3 @@
-// if / while / for / match.
-
 const std = @import("std");
 const llvm = @import("llvm");
 const ast = @import("../ast.zig");
@@ -19,8 +17,6 @@ pub fn codegen_control_flow(cg: *Codegen, cf: *ast.ControlFlowStmt) anyerror!voi
     }
 }
 
-// --- helpers --- //
-
 fn parent_function(cg: *Codegen) llvm.LLVMValueRef {
     return llvm.LLVMGetBasicBlockParent(cg.entry);
 }
@@ -29,7 +25,6 @@ fn new_block(cg: *Codegen, name: [*c]const u8) Block {
     return llvm.LLVMAppendBasicBlockInContext(cg.ctx, parent_function(cg), name);
 }
 
-// jump to `target`, unless the current block already ended (return / break / ...)
 fn br_if_open(cg: *Codegen, target: Block) void {
     const cur = llvm.LLVMGetInsertBlock(cg.builder);
     if (llvm.LLVMGetBasicBlockTerminator(cur) == null) {
@@ -37,7 +32,6 @@ fn br_if_open(cg: *Codegen, target: Block) void {
     }
 }
 
-// conditions are allowed to be wider than i1, those compare `!= 0`
 fn to_i1(cg: *Codegen, cond: Value) Value {
     const width = llvm.LLVMGetIntTypeWidth(llvm.LLVMTypeOf(cond));
     if (width == 1) return cond;
@@ -49,7 +43,6 @@ fn at(cg: *Codegen, block: Block) void {
     llvm.LLVMPositionBuilderAtEnd(cg.builder, block);
 }
 
-// a loop body: `break` goes to `break_bb`, `continue` to `continue_bb`
 fn loop_body(cg: *Codegen, body: std.ArrayList(ast.Stmt), break_bb: Block, continue_bb: Block) !void {
     try cg.break_targets.append(cg.allocator, break_bb);
     try cg.continue_targets.append(cg.allocator, continue_bb);
@@ -59,8 +52,6 @@ fn loop_body(cg: *Codegen, body: std.ArrayList(ast.Stmt), break_bb: Block, conti
     }
     try cg.codegen_statements(body);
 }
-
-// --- if --- //
 
 fn codegen_if(cg: *Codegen, i: *ast.IfExpr) !void {
     const then_bb = new_block(cg, "");
@@ -103,8 +94,6 @@ fn codegen_if(cg: *Codegen, i: *ast.IfExpr) !void {
     at(cg, merge_bb);
 }
 
-// --- while --- //
-
 fn codegen_while(cg: *Codegen, w: *ast.WhileExpr) !void {
     const cond_bb = new_block(cg, "");
     const while_bb = new_block(cg, "");
@@ -123,8 +112,6 @@ fn codegen_while(cg: *Codegen, w: *ast.WhileExpr) !void {
     at(cg, merge_bb);
 }
 
-// --- for --- //
-
 fn codegen_for(cg: *Codegen, f: *ast.ForExpr) !void {
     // todo: slices based iterations
     const iter_ty = cg.expr_type(f.iterable);
@@ -135,7 +122,6 @@ fn codegen_for(cg: *Codegen, f: *ast.ForExpr) !void {
     }
 }
 
-// allocates the optional `index` binding of `for (i, x) ...`
 fn enumerate_setup(cg: *Codegen, f: *ast.ForExpr) !?Value {
     const ib = f.index_binding orelse return null;
     const start_ty = try cg.get_llvm_type_of(cg.expr_type(f.index_start.?));
@@ -251,8 +237,6 @@ fn codegen_for_range(cg: *Codegen, f: *ast.ForExpr, ty: types.TypeId) !void {
 
     at(cg, merge_bb);
 }
-
-// --- match --- //
 
 fn codegen_match(cg: *Codegen, m: *ast.MatchExpr) !void {
     const sub = try cg.codegen_expression(m.subject);

@@ -1,6 +1,3 @@
-// Numeric helpers: classification, implicit conversions, and the arithmetic
-// comparison instruction builders shared by binary and compound-assign ops.
-
 const std = @import("std");
 const llvm = @import("llvm");
 const ast = @import("../ast.zig");
@@ -37,13 +34,9 @@ pub fn coerce(cg: *Codegen, val: Value, from: types.TypeId, to: types.TypeId) !V
     return val;
 }
 
-// --- operators --- //
-
-// the operators `ast.BinaryOp` and `ast.CompoundOp` have in common
 pub const ArithOp = enum { add, sub, mul, div, mod, bit_or, bit_xor, bit_and, shl, shr };
 pub const CmpOp = enum { eq, ne, lt, gt, le, ge };
 
-// `op` is an `ast.BinaryOp` or an `ast.CompoundOp`
 pub fn arith_of(op: anytype) ?ArithOp {
     return std.meta.stringToEnum(ArithOp, @tagName(op));
 }
@@ -52,7 +45,6 @@ pub fn cmp_of(op: anytype) ?CmpOp {
     return std.meta.stringToEnum(CmpOp, @tagName(op));
 }
 
-// `suffix` only names the instruction in the IR ("add_bin", "add_compound", ...)
 pub fn build_arith(cg: *Codegen, comptime suffix: []const u8, op: ArithOp, l: Value, r: Value, float: bool, signed: bool) Value {
     const b = cg.builder;
     return switch (op) {
@@ -92,11 +84,10 @@ pub fn build_cmp(cg: *Codegen, op: CmpOp, l: Value, r: Value, float: bool, signe
     return llvm.LLVMBuildICmp(cg.builder, pred, l, r, name);
 }
 
-// `x op= y`
 pub fn compound_op(cg: *Codegen, op: ast.CompoundOp, l: Value, r: Value, signed: bool) Value {
     const kind = llvm.LLVMGetTypeKind(llvm.LLVMTypeOf(l));
     const float = kind == llvm.LLVMFloatTypeKind or kind == llvm.LLVMDoubleTypeKind;
     const aop = arith_of(op).?;
-    // note: `>>=` has always been a logical shift, even on signed types
+    // note: has always been a logical shift, even on signed types
     return build_arith(cg, "compound", aop, l, r, float, signed and aop != .shr);
 }

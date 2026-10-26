@@ -1,5 +1,3 @@
-// Type lowering: AST / sema types -> LLVM types, plus struct and enum layouts.
-
 const std = @import("std");
 const llvm = @import("llvm");
 const ast = @import("../ast.zig");
@@ -8,8 +6,6 @@ const Codegen = @import("codegen.zig").Codegen;
 
 const log = std.log.scoped(.codegen);
 
-// `p` is either an `ast.PrimitiveType` or a `types.Primitive`, both have same tag.
-// so that we can just have one func for both!
 pub fn primitive_type(cg: *Codegen, p: anytype) llvm.LLVMTypeRef {
     return switch (p) {
         .i8, .u8 => llvm.LLVMInt8TypeInContext(cg.ctx),
@@ -31,7 +27,6 @@ pub fn slice_type(cg: *Codegen, elem: llvm.LLVMTypeRef) llvm.LLVMTypeRef {
     return llvm.LLVMStructTypeInContext(cg.ctx, &fields, fields.len, 0);
 }
 
-// type written in the source (annotations, params, fields)
 pub fn get_type(cg: *Codegen, ret_type: *ast.Type) anyerror!llvm.LLVMTypeRef {
     // TODO: handle optionals and errors
     switch (ret_type.base) {
@@ -61,7 +56,6 @@ pub fn get_type(cg: *Codegen, ret_type: *ast.Type) anyerror!llvm.LLVMTypeRef {
     }
 }
 
-// type computed by sema (expression types)
 pub fn llvm_type_of(cg: *Codegen, ty: types.TypeId) anyerror!llvm.LLVMTypeRef {
     // note: for temp if some types are not managed in sema for now
     if (ty == .invalid) return llvm.LLVMInt32TypeInContext(cg.ctx);

@@ -1,5 +1,3 @@
-// Expressions.
-
 const std = @import("std");
 const llvm = @import("llvm");
 const ast = @import("../ast.zig");
@@ -29,8 +27,6 @@ pub fn codegen_expression_with_type(cg: *Codegen, e: *ast.Expr, expected_ty: ?ll
     };
 }
 
-// --- leaves --- //
-
 fn codegen_literal(cg: *Codegen, l: *ast.LiteralExpr, e: *ast.Expr) !Value {
     const ty = cg.expr_type(e);
 
@@ -55,7 +51,6 @@ fn codegen_literal(cg: *Codegen, l: *ast.LiteralExpr, e: *ast.Expr) !Value {
 }
 
 fn codegen_ident(cg: *Codegen, i: *ast.IdentExpr) !Value {
-    // load var from stack
     if (cg.stack_map.get(i.name)) |v| {
         return llvm.LLVMBuildLoad2(cg.builder, llvm.LLVMGetAllocatedType(v), v, "");
     }
@@ -65,8 +60,6 @@ fn codegen_ident(cg: *Codegen, i: *ast.IdentExpr) !Value {
     }
     return error.VariableNotFound;
 }
-
-// --- operators --- //
 
 fn codegen_binary(cg: *Codegen, b: *ast.BinaryExpr) anyerror!Value {
     var l = try codegen_expression(cg, b.lhs);
@@ -159,8 +152,6 @@ fn codegen_new(cg: *Codegen, expr: *ast.Expr) !Value {
     return ptr;
 }
 
-// --- aggregates --- //
-
 fn codegen_array(cg: *Codegen, a: *ast.ArrayLiteralExpr, e: *ast.Expr) anyerror!Value {
     const array_ty = try cg.get_llvm_type_of(cg.expr_type(e));
     const arr = llvm.LLVMBuildAlloca(cg.builder, array_ty, "");
@@ -192,7 +183,6 @@ fn codegen_struct_literal(cg: *Codegen, s_lit: *ast.StructLiteral, expected_ty: 
     return struct_value;
 }
 
-// `assign`: return a pointer to the field instead of its value
 pub fn codegen_field_access(cg: *Codegen, f_access: *ast.FieldAccessExpr, assign: bool) anyerror!Value {
     const target_ty = cg.expr_type(f_access.target);
     if (target_ty == .invalid) return error.InvalidType;
@@ -253,7 +243,6 @@ pub fn codegen_field_access(cg: *Codegen, f_access: *ast.FieldAccessExpr, assign
     return llvm.LLVMBuildLoad2(cg.builder, llvm_field_ty, field_ptr, "");
 }
 
-// `Enum.Variant` (the tag value) or `value.Variant` (the payload of a tagged enum)
 fn codegen_enum_field(cg: *Codegen, f: *ast.FieldAccessExpr, enum_ty: types.TypeId, assign: bool) anyerror!Value {
     const field_name = f.field.*.ident.name;
 
@@ -275,8 +264,6 @@ fn codegen_enum_field(cg: *Codegen, f: *ast.FieldAccessExpr, enum_ty: types.Type
     return error.UnknownEnumVariant;
 }
 
-// --- indexing --- //
-
 fn array_element_gep(cg: *Codegen, array_ty: llvm.LLVMTypeRef, arr: Value, index: Value) Value {
     var indices = [2]Value{
         llvm.LLVMConstInt(llvm.LLVMInt64TypeInContext(cg.ctx), 0, 0),
@@ -285,7 +272,6 @@ fn array_element_gep(cg: *Codegen, array_ty: llvm.LLVMTypeRef, arr: Value, index
     return llvm.LLVMBuildGEPWithNoWrapFlags(cg.builder, array_ty, arr, &indices, 2, "", 0);
 }
 
-// `ret_gep`: return the element pointer instead of the loaded element
 pub fn codegen_slice_index(cg: *Codegen, i: *ast.IndexExpr, slice_ty: types.TypeId, ret_gep: bool) anyerror!Value {
     const slice_llvm_ty = try cg.get_llvm_type_of(slice_ty);
     const slice_ptr = switch (i.target.*) {
@@ -339,7 +325,6 @@ fn codegen_index(cg: *Codegen, i: *ast.IndexExpr, ret_gep: bool) anyerror!Value 
     };
 }
 
-// pointer to `array[index]` (for assignments)
 pub fn codegen_array_element_ptr(cg: *Codegen, i: *ast.IndexExpr) !Value {
     if (i.args.items.len != 1) return error.InvalidArrayIndex;
 

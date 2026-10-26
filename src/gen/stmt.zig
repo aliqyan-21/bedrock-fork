@@ -1,5 +1,3 @@
-// Statements: locals, assignment, return, expression statements.
-
 const std = @import("std");
 const llvm = @import("llvm");
 const ast = @import("../ast.zig");
@@ -43,8 +41,6 @@ fn codegen_expression_statement(cg: *Codegen, e_stmt: *ast.ExprStmt) !void {
     _ = try cg.codegen_expression(e);
 }
 
-// --- locals --- //
-
 fn alloca_for(cg: *Codegen, name: []const u8, type_ann: ?*ast.Type, value: *ast.Expr) !Value {
     const t = if (type_ann) |ann| try cg.get_type(ann) else try cg.get_llvm_type_of(cg.expr_type(value));
     const n = try cg.cstr(name);
@@ -52,7 +48,6 @@ fn alloca_for(cg: *Codegen, name: []const u8, type_ann: ?*ast.Type, value: *ast.
     return llvm.LLVMBuildAlloca(cg.builder, t, n.ptr);
 }
 
-// `var` / `const` inside a body (a const is only different for sema)
 fn codegen_local(cg: *Codegen, name: []const u8, type_ann: ?*ast.Type, value: *ast.Expr) !void {
     switch (value.*) {
         .array_literal => {
@@ -76,30 +71,26 @@ fn codegen_local(cg: *Codegen, name: []const u8, type_ann: ?*ast.Type, value: *a
                     else => {},
                 }
             }
-            try codegen_scalar_local(cg, name, type_ann, value);
+
+            const alloca = try alloca_for(cg, name, type_ann, value);
+            if (value.* == .undefined) {
+                try cg.stack_map.put(name, alloca);
+                return;
+            }
+            var e = try cg.codegen_expression(value);
+            if (type_ann) |ann| {
+                if (ann.base == .primitive) {
+                    const target_ty = try cg.ts().from_ast_primitive(ann.base.primitive);
+                    e = try cg.coerce_numeric(e, cg.expr_type(value), target_ty);
+                }
+            }
+            // store value on stack space
+            _ = llvm.LLVMBuildStore(cg.builder, e, alloca);
+            try cg.stack_map.put(name, alloca);
         },
     }
 }
 
-fn codegen_scalar_local(cg: *Codegen, name: []const u8, type_ann: ?*ast.Type, value: *ast.Expr) !void {
-    const alloca = try alloca_for(cg, name, type_ann, value);
-    if (value.* == .undefined) {
-        try cg.stack_map.put(name, alloca);
-        return;
-    }
-    var e = try cg.codegen_expression(value);
-    if (type_ann) |ann| {
-        if (ann.base == .primitive) {
-            const target_ty = try cg.ts().from_ast_primitive(ann.base.primitive);
-            e = try cg.coerce_numeric(e, cg.expr_type(value), target_ty);
-        }
-    }
-    // store value on stack space
-    _ = llvm.LLVMBuildStore(cg.builder, e, alloca);
-    try cg.stack_map.put(name, alloca);
-}
-
-// `var x: Enum = Enum.Variant(payload)`
 fn codegen_tagged_enum(cg: *Codegen, name: []const u8, value: *ast.Expr, enum_name: []const u8, enum_ty: llvm.LLVMTypeRef) !void {
     const call = switch (value.*) {
         .call => |*c| c,
@@ -131,8 +122,6 @@ fn codegen_tagged_enum(cg: *Codegen, name: []const u8, value: *ast.Expr, enum_na
         try cg.stack_map.put(name, e_alloca);
     }
 }
-
-// --- assignment --- //
 
 fn codegen_assign(cg: *Codegen, a: *ast.AssignStmt) !void {
     switch (a.target.*) {
@@ -177,7 +166,6 @@ fn assign_index(cg: *Codegen, a: *ast.AssignStmt, i: *ast.IndexExpr) !void {
     try assign_through(cg, a, ptr, rhs);
 }
 
-// store `rhs` into `ptr` (or apply the compound op `x op= rhs`)
 fn assign_through(cg: *Codegen, a: *ast.AssignStmt, ptr: Value, rhs: Value) !void {
     const ty = cg.expr_type(a.target);
     const e = try cg.coerce_numeric(rhs, cg.expr_type(a.value), ty);

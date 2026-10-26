@@ -1,5 +1,3 @@
-// Calls (and the array -> slice argument conversion).
-
 const std = @import("std");
 const llvm = @import("llvm");
 const ast = @import("../ast.zig");

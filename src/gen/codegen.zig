@@ -1,5 +1,3 @@
-// LLVM code generation.
-// The other files in the 'gen' directory are free functions taking `cg: *Codegen`.
 const std = @import("std");
 const llvm = @import("llvm");
 const compiler = @import("../compiler.zig");
@@ -114,8 +112,6 @@ pub const Codegen = struct {
         self.enum_tag.deinit();
     }
 
-    // --- small helpers used by every codegen file --- //
-
     pub fn ts(self: *Codegen) *types.TypeSystem {
         return &self.compiler.sema.types;
     }
@@ -154,8 +150,6 @@ pub const Codegen = struct {
     pub fn codegen_statements(self: *Codegen, stmts: std.ArrayList(ast.Stmt)) anyerror!void {
         return stmt_mod.codegen_statements(self, stmts);
     }
-
-    // --- driver --- //
 
     pub fn codegen_alloc_mem(self: *Codegen) !void {
         const ret_init = llvm.LLVMVoidTypeInContext(self.ctx);
@@ -203,8 +197,6 @@ pub const Codegen = struct {
     pub fn codegen_program(self: *Codegen, program: ast.Program) !void {
         try self.codegen_items(program.items);
     }
-
-    const Phase = enum { types, signatures, globals, bodies };
 
     pub fn codegen_items(self: *Codegen, items: std.ArrayList(ast.Item)) !void {
         for (items.items) |*item| {
@@ -294,9 +286,6 @@ pub const Codegen = struct {
         try cg.enum_types.put(name, e_ty);
     }
 
-    // --- globals --- //
-
-    // top level `var` / `const`
     fn codegen_global(self: *Codegen, name: []const u8, type_ann: ?*ast.Type, value: *ast.Expr) !void {
         const ty = if (type_ann) |a| try self.get_type(a) else try self.get_llvm_type_of(self.expr_type(value));
         const name_z = try self.cstr(name);
@@ -319,8 +308,6 @@ pub const Codegen = struct {
         try self.global_map.put(name, global);
     }
 
-    // --- functions --- //
-
     pub fn codegen_params(self: *Codegen, params: std.ArrayList(ast.Param)) ![]llvm.LLVMTypeRef {
         const p_types = try self.allocator.alloc(llvm.LLVMTypeRef, params.items.len);
         for (params.items, 0..) |param, idx| {
@@ -338,13 +325,7 @@ pub const Codegen = struct {
     }
 
     // adds a function to the module: the shared part of functions, procs and externs
-    fn declare_callable(
-        self: *Codegen,
-        name: []const u8,
-        params: std.ArrayList(ast.Param),
-        ret_type: llvm.LLVMTypeRef,
-        is_variadic: bool,
-    ) !llvm.LLVMValueRef {
+    fn declare_callable(self: *Codegen, name: []const u8, params: std.ArrayList(ast.Param), ret_type: llvm.LLVMTypeRef, is_variadic: bool) !llvm.LLVMValueRef {
         const param_types = try self.codegen_params(params);
         defer self.allocator.free(param_types);
         const func_type = llvm.LLVMFunctionType(ret_type, param_types.ptr, @intCast(params.items.len), if (is_variadic) 1 else 0);
@@ -370,13 +351,7 @@ pub const Codegen = struct {
     }
 
     // the body of an already declared function / proc
-    fn codegen_callable_body(
-        self: *Codegen,
-        name: []const u8,
-        params: std.ArrayList(ast.Param),
-        body: std.ArrayList(ast.Stmt),
-        comptime is_proc: bool,
-    ) !void {
+    fn codegen_callable_body(self: *Codegen, name: []const u8, params: std.ArrayList(ast.Param), body: std.ArrayList(ast.Stmt), comptime is_proc: bool) !void {
         const name_z = try self.cstr(name);
         defer self.allocator.free(name_z);
         const func = llvm.LLVMGetNamedFunction(self.mod, name_z.ptr) orelse return error.FunctionNotDeclared;
@@ -425,8 +400,6 @@ pub const Codegen = struct {
         };
         llvm.LLVMSetLinkage(func, llvm.LLVMExternalLinkage);
     }
-
-    // --- methods --- //
 
     pub fn declare_methods(self: *Codegen, s_def: *ast.StructDef) !void {
         for (s_def.methods.items) |*m| switch (m.*) {
