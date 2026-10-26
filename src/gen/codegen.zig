@@ -207,39 +207,91 @@ pub const Codegen = struct {
     const Phase = enum { types, signatures, globals, bodies };
 
     pub fn codegen_items(self: *Codegen, items: std.ArrayList(ast.Item)) !void {
-        // forward references: every phase runs over all items before the next starts
-        for ([_]Phase{ .types, .signatures, .globals, .bodies }) |phase| {
-            for (items.items) |*item| try self.codegen_item(item, phase);
+        for (items.items) |*item| {
+            switch (item.*) {
+                .function => |*f| _ = try self.declare_function(f, f.name),
+                .proc => |*p| _ = try self.declare_proc(p, p.name),
+                .extern_def => |*e| try self.codegen_extern(e),
+                .type_def => |*t| try self.codegen_typedef(t),
+                .var_def => |*v| try self.codegen_global(v.name, v.type_ann, v.value),
+                .const_def => |*c| try self.codegen_global(c.name, c.type_ann, c.value),
+                else => {},
+            }
+        }
+
+        for (items.items) |*item| {
+            switch (item.*) {
+                .function => |*f| try self.codegen_function(f, f.name),
+                .proc => |*p| try self.codegen_proc(p, p.name),
+                else => {},
+            }
         }
     }
 
-    fn codegen_item(self: *Codegen, item: *ast.Item, phase: Phase) !void {
-        switch (item.*) {
-            .function => |*f| switch (phase) {
-                .signatures => _ = try self.declare_function(f, f.name),
-                .bodies => try self.codegen_function(f, f.name),
-                else => {},
+    pub fn codegen_typedef(self: *Codegen, t_def: *ast.TypeDef) !void {
+        return switch (t_def.variant) {
+            .struct_def => |*s| {
+                try self.codegen_struct_def(s);
+                try self.declare_methods(s);
+                try self.codegen_methods(s);
             },
-            .proc => |*p| switch (phase) {
-                .signatures => _ = try self.declare_proc(p, p.name),
-                .bodies => try self.codegen_proc(p, p.name),
-                else => {},
-            },
-            .extern_def => |*e| if (phase == .signatures) try self.codegen_extern(e),
-            .type_def => |*t| switch (t.variant) {
-                .struct_def => |*s| switch (phase) {
-                    .types => try lower_types.struct_def(self, s),
-                    .signatures => try self.declare_methods(s),
-                    .bodies => try self.codegen_methods(s),
-                    .globals => {},
-                },
-                .enum_def => |*e| if (phase == .types) try lower_types.enum_def(self, e),
-                .alias => {},
-            },
-            .var_def => |*v| if (phase == .globals) try self.codegen_global(v.name, v.type_ann, v.value),
-            .const_def => |*c| if (phase == .globals) try self.codegen_global(c.name, c.type_ann, c.value),
+            .enum_def => |*e| try self.codegen_enum(e),
             else => {},
+        };
+    }
+
+    pub fn codegen_struct_def(cg: *Codegen, s_def: *ast.StructDef) !void {
+        const fields = try cg.allocator.alloc(llvm.LLVMTypeRef, s_def.fields.items.len);
+        defer cg.allocator.free(fields);
+        for (s_def.fields.items, 0..) |f, idx| {
+            fields[idx] = try get_type(cg, f.type);
         }
+
+        const s_ty = llvm.LLVMStructTypeInContext(cg.ctx, fields.ptr, @intCast(fields.len), 0);
+        try cg.struct_types.put(s_def.name, s_ty);
+
+        // TODO: the named struct is created but never used (struct_types holds the literal type)
+        const name = try cg.cstr(s_def.name);
+        defer cg.allocator.free(name);
+        _ = llvm.LLVMStructCreateNamed(cg.ctx, name.ptr);
+    }
+
+    pub fn codegen_enum(cg: *Codegen, e_def: *ast.EnumDef) !void {
+        // get the largest enum variant to allocate enough space
+        // TODO: multiple type variant
+        var l_width: usize = 0;
+        for (e_def.variants.items, 0..) |*ev, i| {
+            if (ev.types.items.len == 0) continue;
+
+            const v_elems = try cg.allocator.alloc(llvm.LLVMTypeRef, ev.types.items.len + 1);
+            defer cg.allocator.free(v_elems);
+            // tagged variant with i8
+            v_elems[0] = llvm.LLVMInt8TypeInContext(cg.ctx);
+            for (ev.types.items, 1..) |t, idx| {
+                const ty = try get_type(cg, t);
+                const tar_data = llvm.LLVMGetModuleDataLayout(cg.mod);
+                const w_ty = llvm.LLVMABISizeOfType(tar_data, ty);
+                if (w_ty > l_width) l_width = w_ty;
+                v_elems[idx] = ty;
+            }
+
+            // allocate for variant types
+            const name = try cg.allocator.dupe(u8, ev.name);
+            const v_ty = llvm.LLVMStructTypeInContext(cg.ctx, v_elems.ptr, @intCast(ev.types.items.len + 1), 0);
+            try cg.enum_types.put(name, v_ty);
+            try cg.enum_tag.put(name, i);
+        }
+
+        // c type simple enum
+        if (l_width == 0) return;
+
+        // allocate a range of bytes(i8), with alignment and padding
+        const name = try cg.allocator.dupe(u8, e_def.name);
+        const arr_ty = llvm.LLVMArrayType(llvm.LLVMInt8TypeInContext(cg.ctx), @intCast(l_width));
+        var elems: [2]llvm.LLVMTypeRef = .{ llvm.LLVMInt8TypeInContext(cg.ctx), arr_ty };
+        const e_ty = llvm.LLVMStructTypeInContext(cg.ctx, @ptrCast(&elems), 2, 0);
+        log.debug("enum type registered: {s}", .{name});
+        try cg.enum_types.put(name, e_ty);
     }
 
     // --- globals --- //
